@@ -175,6 +175,51 @@ def generate_area_colors(areas):
 def main():
     st.title("Анализ недвижимости в Дубае")
     
+    # Проверка наличия и доступности базы данных
+    if not os.path.isfile(SQLITE_DB_PATH):
+        st.error(f"Файл базы данных не найден: {SQLITE_DB_PATH}")
+        st.info("Проверьте, что файл базы данных загружен в репозиторий и находится в корневой директории проекта.")
+        return
+    
+    try:
+        db_size = os.path.getsize(SQLITE_DB_PATH) / (1024 * 1024)  # Размер в МБ
+        st.sidebar.info(f"База данных: {SQLITE_DB_PATH}\nРазмер: {db_size:.2f} МБ")
+        
+        # Проверяем доступность базы данных
+        conn = get_db_connection()
+        if conn is None:
+            st.error("Не удалось подключиться к базе данных.")
+            return
+            
+        # Проверяем структуру базы данных
+        try:
+            tables_df = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table';", conn)
+            if 'properties' not in tables_df['name'].values:
+                st.error("В базе данных отсутствует таблица 'properties'.")
+                st.write("Найденные таблицы:", tables_df)
+                conn.close()
+                return
+                
+            # Проверяем наличие записей
+            count_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties;", conn)
+            record_count = count_df.iloc[0]['count']
+            
+            # Проверяем наличие координат
+            coords_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties WHERE latitude IS NOT NULL AND longitude IS NOT NULL;", conn)
+            coords_count = coords_df.iloc[0]['count']
+            
+            st.sidebar.info(f"Всего записей: {record_count}\nЗаписей с координатами: {coords_count}")
+            
+            if coords_count == 0:
+                st.warning("В базе данных нет записей с координатами. Карта не может быть отображена.")
+        except Exception as db_error:
+            st.error(f"Ошибка при проверке структуры базы данных: {db_error}")
+        finally:
+            conn.close()
+    except Exception as e:
+        st.error(f"Ошибка при проверке базы данных: {e}")
+        return
+    
     # Отображаем информацию о базе данных
     db_exists = os.path.isfile(SQLITE_DB_PATH)
     if db_exists:
@@ -207,75 +252,169 @@ def main():
         st.caption(f"Объекты площадью до {max_size} кв.м.")
         
         # Получаем данные для карты
-        map_data_df = get_map_data(max_size=max_size)
-        
-        if map_data_df is not None and not map_data_df.empty:
-            # Генерируем цвета для районов
-            area_colors = generate_area_colors(map_data_df['area'])
+        try:
+            map_data_df = get_map_data(max_size=max_size)
             
-            # Создаем карту
-            dubai_map = folium.Map(location=[25.2048, 55.2708], zoom_start=11)
+            # Выводим отладочную информацию
+            st.write(f"Загружено записей: {0 if map_data_df is None else len(map_data_df)}")
             
-            # Добавляем кластеризацию
-            marker_cluster = folium.plugins.MarkerCluster().add_to(dubai_map)
-            
-            # Добавляем маркеры
-            for _, row in map_data_df.iterrows():
-                if pd.notna(row['latitude']) and pd.notna(row['longitude']):
-                    # Получаем цвет для района
-                    area = row.get('area', 'Неизвестно')
-                    color = area_colors.get(area, '#3186cc')  # Если район не найден, используем цвет по умолчанию
+            if map_data_df is not None and not map_data_df.empty:
+                # Проверяем наличие координат
+                valid_coords = map_data_df[map_data_df['latitude'].notna() & map_data_df['longitude'].notna()]
+                st.write(f"Записей с координатами: {len(valid_coords)}")
+                
+                if len(valid_coords) > 0:
+                    # Создаем переключатель для выбора типа карты
+                    map_type = st.radio("Тип карты:", ["Интерактивная (Folium)", "Простая (Streamlit)"])
                     
-                    # Создаем иконку с нужным цветом
-                    icon = folium.Icon(icon="home", prefix="fa", color=color.lstrip('#'))
-                    
-                    # Форматируем всплывающее окно
-                    popup_text = f"""
-                    <b>{row.get('title', 'Без названия')}</b><br>
-                    Цена: {row.get('price', 'Н/Д')} AED<br>
-                    Район: {area}<br>
-                    Тип: {row.get('property_type', 'Н/Д')}<br>
-                    Площадь: {row.get('size', 'Н/Д')} кв.м.<br>
-                    Спальни: {row.get('bedrooms', 'Н/Д')}<br>
-                    Ванные: {row.get('bathrooms', 'Н/Д')}<br>
-                    <a href="?property_id={row.get('id')}" target="_self">Подробнее</a>
-                    """
-                    
-                    folium.Marker(
-                        location=[row['latitude'], row['longitude']],
-                        popup=folium.Popup(popup_text, max_width=300),
-                        tooltip=f"{row.get('title', 'Объект')} - {row.get('price', 'Н/Д')} AED",
-                        icon=icon
-                    ).add_to(marker_cluster)
+                    if map_type == "Простая (Streamlit)":
+                        # Используем встроенную карту Streamlit (более простая, но надежная)
+                        st.subheader("Простая карта")
+                        # Подготавливаем данные для st.map
+                        map_ready_df = valid_coords[['latitude', 'longitude']].copy()
+                        # Streamlit ожидает колонки lat и lon
+                        map_ready_df.columns = ['lat', 'lon']
+                        # Добавляем колонку для цвета (необязательно)
+                        if 'price' in valid_coords.columns:
+                            # Нормализуем цены для отображения цвета
+                            min_price = valid_coords['price'].min()
+                            max_price = valid_coords['price'].max()
+                            if max_price > min_price:
+                                map_ready_df['price_norm'] = (valid_coords['price'] - min_price) / (max_price - min_price)
+                            else:
+                                map_ready_df['price_norm'] = 0.5
+                        
+                        # Отображаем карту
+                        st.map(map_ready_df, size=20)
+                        
+                        # Отображаем легенду (опционально)
+                        if 'price' in valid_coords.columns:
+                            st.caption("Цвет маркера отражает стоимость объекта (темнее = дороже)")
+                        
+                        # Выводим таблицу с данными для возможности клика на объекты
+                        st.subheader("Данные объектов")
+                        display_cols = ['id', 'title', 'price', 'area', 'property_type', 'size']
+                        available_cols = [col for col in display_cols if col in valid_coords.columns]
+                        
+                        # Создаем ссылки в столбце title
+                        if 'title' in available_cols and 'id' in available_cols:
+                            valid_coords['title'] = valid_coords.apply(
+                                lambda row: f"<a href='?property_id={row['id']}'>{row['title']}</a>", 
+                                axis=1
+                            )
+                        
+                        # Отображаем таблицу с данными
+                        st.write(valid_coords[available_cols].to_html(escape=False), unsafe_allow_html=True)
+                    else:
+                        # Генерируем цвета для районов
+                        area_colors = generate_area_colors(map_data_df['area'])
+                        
+                        try:
+                            # Создаем карту
+                            dubai_map = folium.Map(location=[25.2048, 55.2708], zoom_start=11)
+                            
+                            # Добавляем кластеризацию
+                            try:
+                                from folium.plugins import MarkerCluster
+                                marker_cluster = MarkerCluster().add_to(dubai_map)
+                            except Exception as cluster_error:
+                                st.error(f"Ошибка при создании кластеризации: {cluster_error}")
+                                # Если кластеризация не работает, добавляем маркеры напрямую на карту
+                                marker_cluster = dubai_map
+                            
+                            # Добавляем маркеры
+                            for _, row in valid_coords.iterrows():
+                                try:
+                                    # Получаем цвет для района
+                                    area = row.get('area', 'Неизвестно')
+                                    color = area_colors.get(area, '#3186cc')  # Если район не найден, используем цвет по умолчанию
+                                    
+                                    # Создаем иконку с нужным цветом
+                                    icon = folium.Icon(icon="home", prefix="fa", color=color.lstrip('#'))
+                                    
+                                    # Форматируем всплывающее окно
+                                    popup_text = f"""
+                                    <b>{row.get('title', 'Без названия')}</b><br>
+                                    Цена: {row.get('price', 'Н/Д')} AED<br>
+                                    Район: {area}<br>
+                                    Тип: {row.get('property_type', 'Н/Д')}<br>
+                                    Площадь: {row.get('size', 'Н/Д')} кв.м.<br>
+                                    Спальни: {row.get('bedrooms', 'Н/Д')}<br>
+                                    Ванные: {row.get('bathrooms', 'Н/Д')}<br>
+                                    <a href="?property_id={row.get('id')}" target="_self">Подробнее</a>
+                                    """
+                                    
+                                    folium.Marker(
+                                        location=[row['latitude'], row['longitude']],
+                                        popup=folium.Popup(popup_text, max_width=300),
+                                        tooltip=f"{row.get('title', 'Объект')} - {row.get('price', 'Н/Д')} AED",
+                                        icon=icon
+                                    ).add_to(marker_cluster)
+                                except Exception as marker_error:
+                                    st.error(f"Ошибка при добавлении маркера: {marker_error}")
+                            
+                            # Добавляем легенду для цветов районов
+                            legend_html = """
+                            <div style="position: fixed; 
+                                        bottom: 50px; left: 50px; width: 250px; height: auto;
+                                        border:2px solid grey; z-index:9999; font-size:12px;
+                                        background-color:white; padding: 10px;
+                                        overflow-y: auto; max-height: 300px;">
+                                <div style="font-weight: bold; margin-bottom: 5px;">Районы:</div>
+                            """
+                            
+                            # Добавляем цвета для каждого района
+                            for area, color in area_colors.items():
+                                legend_html += f"""
+                                <div style="display: flex; align-items: center; margin-bottom: 3px;">
+                                    <div style="background-color: {color}; width: 15px; height: 15px; margin-right: 5px;"></div>
+                                    <div>{area}</div>
+                                </div>
+                                """
+                            
+                            legend_html += "</div>"
+                            dubai_map.get_root().html.add_child(folium.Element(legend_html))
+                            
+                            # Отображаем карту
+                            try:
+                                folium_static(dubai_map, width=1200, height=600)
+                                st.info(f"Отображено {len(valid_coords)} объектов недвижимости. Точки раскрашены по районам.")
+                            except Exception as render_error:
+                                st.error(f"Ошибка при отображении карты: {render_error}")
+                        except Exception as map_error:
+                            st.error(f"Ошибка при создании карты: {map_error}")
+                else:
+                    st.warning("Не найдено объектов с координатами для отображения на карте")
+            else:
+                st.warning("Не удалось загрузить данные для карты")
+        except Exception as e:
+            st.error(f"Критическая ошибка при загрузке карты: {e}")
             
-            # Добавляем легенду для цветов районов
-            legend_html = """
-            <div style="position: fixed; 
-                        bottom: 50px; left: 50px; width: 250px; height: auto;
-                        border:2px solid grey; z-index:9999; font-size:12px;
-                        background-color:white; padding: 10px;
-                        overflow-y: auto; max-height: 300px;">
-                <div style="font-weight: bold; margin-bottom: 5px;">Районы:</div>
-            """
-            
-            # Добавляем цвета для каждого района
-            for area, color in area_colors.items():
-                legend_html += f"""
-                <div style="display: flex; align-items: center; margin-bottom: 3px;">
-                    <div style="background-color: {color}; width: 15px; height: 15px; margin-right: 5px;"></div>
-                    <div>{area}</div>
-                </div>
-                """
-            
-            legend_html += "</div>"
-            dubai_map.get_root().html.add_child(folium.Element(legend_html))
-            
-            # Отображаем карту
-            folium_static(dubai_map, width=1200, height=600)
-            
-            st.info(f"Отображено {len(map_data_df)} объектов недвижимости. Точки раскрашены по районам.")
-        else:
-            st.warning("Не удалось загрузить данные для карты")
+            # Проверяем файл базы данных
+            db_exists = os.path.isfile(SQLITE_DB_PATH)
+            if not db_exists:
+                st.error(f"База данных {SQLITE_DB_PATH} не найдена!")
+            else:
+                st.info(f"База данных существует. Размер: {os.path.getsize(SQLITE_DB_PATH) / 1024:.2f} КБ")
+                
+                # Проверяем содержимое базы данных
+                try:
+                    conn = get_db_connection()
+                    if conn:
+                        tables_df = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table';", conn)
+                        st.write("Таблицы в базе данных:", tables_df)
+                        
+                        if 'properties' in tables_df['name'].values:
+                            count_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties;", conn)
+                            st.write(f"Количество записей в таблице properties: {count_df.iloc[0]['count']}")
+                            
+                            # Проверяем наличие координат
+                            coords_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties WHERE latitude IS NOT NULL AND longitude IS NOT NULL;", conn)
+                            st.write(f"Записей с координатами: {coords_df.iloc[0]['count']}")
+                        
+                        conn.close()
+                except Exception as db_error:
+                    st.error(f"Ошибка при проверке базы данных: {db_error}")
     
     with tab2:
         st.header("Самые недорогие квартиры по районам")
