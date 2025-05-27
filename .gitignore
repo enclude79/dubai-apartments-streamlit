@@ -1,0 +1,54 @@
+# Файл с переменными окружения (секреты, ключи)
+.env 
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Виртуальное окружение
+venv/
+ENV/
+env/
+
+# Логи
+*.log
+logs/
+
+# Данные и отчеты
+reports/
+*.csv
+*.xlsx
+*.json
+*.db
+*.sqlite
+
+# Streamlit секреты
+.streamlit/secrets.toml
+
+# Локальные настройки IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Системные файлы
+.DS_Store
+Thumbs.db 
