@@ -1,190 +1,315 @@
+#!/usr/bin/env python
+"""
+Скрипт для экспорта данных из PostgreSQL в SQLite.
+Используется для создания файла SQLite, который можно загрузить в Git
+и использовать в Streamlit Cloud.
+
+Использование:
+    python postgres_to_sqlite.py
+"""
+
 import os
+import pandas as pd
 import psycopg2
 import sqlite3
-import pandas as pd
 from dotenv import load_dotenv
-from datetime import datetime
+import time
 import logging
+from datetime import datetime
 
 # Настройка логирования
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_filename = f'{log_dir}/postgres_to_sqlite_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("postgres_to_sqlite.log"),
+        logging.FileHandler(log_filename, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("postgres_to_sqlite")
+logger = logging.getLogger(__name__)
 
-# Загрузка переменных окружения
+# Загружаем переменные окружения
 load_dotenv()
 
-# Параметры подключения к PostgreSQL
+# Параметры PostgreSQL
 PG_CONFIG = {
-    'host': os.getenv("DB_HOST", "localhost"),
-    'port': os.getenv("DB_PORT", "5432"),
-    'database': os.getenv("DB_NAME", "postgres"),
-    'user': os.getenv("DB_USER", "postgres"),
-    'password': os.getenv("DB_PASSWORD", "")
+    'dbname': os.getenv('DB_NAME', 'postgres'),
+    'user': os.getenv('DB_USER', 'admin'),
+    'password': os.getenv('DB_PASSWORD', 'Enclude79'),
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'port': os.getenv('DB_PORT', '5432')
 }
 
-# Путь к SQLite базе данных
+# Путь к файлу SQLite
 SQLITE_DB_PATH = "dubai_properties.db"
 
-# Таблицы для экспорта
-TABLES_TO_EXPORT = [
-    "properties",
-]
-
-def connect_to_postgres():
-    """Устанавливает соединение с PostgreSQL"""
+def get_postgres_schema():
+    """Получает схему таблицы bayut_properties из PostgreSQL"""
     try:
-        conn = psycopg2.connect(**PG_CONFIG)
-        return conn
+        # Подключаемся к PostgreSQL
+        conn = psycopg2.connect(
+            dbname=PG_CONFIG['dbname'],
+            user=PG_CONFIG['user'],
+            password=PG_CONFIG['password'],
+            host=PG_CONFIG['host'],
+            port=PG_CONFIG['port'],
+            connect_timeout=10
+        )
+        cursor = conn.cursor()
+        
+        # Получаем список колонок и их типов
+        cursor.execute("""
+            SELECT column_name, data_type, character_maximum_length
+            FROM information_schema.columns
+            WHERE table_name = 'bayut_properties'
+            ORDER BY ordinal_position;
+        """)
+        columns = cursor.fetchall()
+        
+        # Получаем информацию о первичном ключе
+        cursor.execute("""
+            SELECT a.attname
+            FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            WHERE i.indrelid = 'bayut_properties'::regclass AND i.indisprimary;
+        """)
+        primary_keys = cursor.fetchall()
+        primary_key_columns = [pk[0] for pk in primary_keys]
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            'columns': columns,
+            'primary_keys': primary_key_columns
+        }
     except Exception as e:
-        logger.error(f"Ошибка подключения к PostgreSQL: {e}")
+        logger.error(f"Ошибка при получении схемы PostgreSQL: {e}")
         return None
 
-def create_sqlite_connection():
-    """Создает соединение с SQLite"""
+def create_sqlite_schema(schema):
+    """Создает схему таблицы в SQLite на основе схемы PostgreSQL"""
+    if not schema:
+        logger.error("Не удалось получить схему PostgreSQL")
+        return False
+    
+    # Преобразование типов данных PostgreSQL в типы SQLite
+    type_mapping = {
+        'integer': 'INTEGER',
+        'bigint': 'INTEGER',
+        'smallint': 'INTEGER',
+        'character varying': 'TEXT',
+        'text': 'TEXT',
+        'boolean': 'INTEGER',  # SQLite не имеет булевого типа
+        'double precision': 'REAL',
+        'real': 'REAL',
+        'numeric': 'REAL',
+        'timestamp without time zone': 'TEXT',
+        'timestamp with time zone': 'TEXT',
+        'date': 'TEXT',
+        'jsonb': 'TEXT',  # JSON хранится как текст в SQLite
+        'json': 'TEXT'
+    }
+    
     try:
+        # Подключаемся к SQLite
         conn = sqlite3.connect(SQLITE_DB_PATH)
-        return conn
-    except Exception as e:
-        logger.error(f"Ошибка создания базы SQLite: {e}")
-        return None
-
-def get_postgres_table_schema(pg_conn, table_name):
-    """Получает схему таблицы PostgreSQL"""
-    try:
-        query = f"""
-        SELECT column_name, data_type
-        FROM information_schema.columns
-        WHERE table_name = '{table_name}'
-        ORDER BY ordinal_position;
-        """
+        cursor = conn.cursor()
         
-        return pd.read_sql_query(query, pg_conn)
-    except Exception as e:
-        logger.error(f"Ошибка получения схемы таблицы {table_name}: {e}")
-        return None
-
-def create_sqlite_table(sqlite_conn, table_name, schema_df):
-    """Создает таблицу в SQLite на основе схемы PostgreSQL"""
-    try:
-        # Создаем SQL-запрос для создания таблицы
-        columns = []
-        for _, row in schema_df.iterrows():
-            col_name = row['column_name']
-            data_type = row['data_type']
-            
-            # Преобразование типов данных PostgreSQL в SQLite
-            if data_type in ('integer', 'bigint', 'smallint'):
-                sqlite_type = 'INTEGER'
-            elif data_type in ('numeric', 'decimal', 'real', 'double precision'):
-                sqlite_type = 'REAL'
-            elif data_type in ('timestamp without time zone', 'timestamp with time zone', 'date', 'time'):
-                sqlite_type = 'TEXT'
-            else:
-                sqlite_type = 'TEXT'
-                
-            columns.append(f"{col_name} {sqlite_type}")
-            
-        create_table_sql = f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(columns)});"
+        # Создаем таблицу properties
+        create_table_sql = "CREATE TABLE IF NOT EXISTS properties (\n"
         
-        # Создаем таблицу
-        cursor = sqlite_conn.cursor()
+        for column in schema['columns']:
+            column_name = column[0]
+            data_type = column[1]
+            max_length = column[2]
+            
+            # Определяем тип SQLite
+            sqlite_type = type_mapping.get(data_type, 'TEXT')
+            
+            # Добавляем определение колонки
+            create_table_sql += f"    {column_name} {sqlite_type}"
+            
+            # Добавляем PRIMARY KEY для первичных ключей
+            if column_name in schema['primary_keys']:
+                create_table_sql += " PRIMARY KEY"
+            
+            create_table_sql += ",\n"
+        
+        # Удаляем последнюю запятую и закрываем скобку
+        create_table_sql = create_table_sql.rstrip(",\n") + "\n);"
+        
+        # Удаляем существующую таблицу, если она есть
+        cursor.execute("DROP TABLE IF EXISTS properties;")
+        
+        # Создаем новую таблицу
         cursor.execute(create_table_sql)
-        sqlite_conn.commit()
-        logger.info(f"Таблица {table_name} создана или уже существует в SQLite")
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        logger.info("Схема SQLite успешно создана")
         return True
     except Exception as e:
-        logger.error(f"Ошибка создания таблицы {table_name} в SQLite: {e}")
+        logger.error(f"Ошибка при создании схемы SQLite: {e}")
         return False
 
-def export_table_data(pg_conn, sqlite_conn, table_name):
-    """Экспортирует данные из таблицы PostgreSQL в SQLite"""
+def export_data(batch_size=1000):
+    """Экспортирует данные из PostgreSQL в SQLite по частям"""
     try:
-        # Получаем данные из PostgreSQL
-        logger.info(f"Экспорт данных из таблицы {table_name}")
-        df = pd.read_sql_query(f"SELECT * FROM {table_name}", pg_conn)
+        # Подключаемся к PostgreSQL
+        pg_conn = psycopg2.connect(
+            dbname=PG_CONFIG['dbname'],
+            user=PG_CONFIG['user'],
+            password=PG_CONFIG['password'],
+            host=PG_CONFIG['host'],
+            port=PG_CONFIG['port'],
+            connect_timeout=10
+        )
+        pg_cursor = pg_conn.cursor()
         
-        if df.empty:
-            logger.warning(f"Таблица {table_name} не содержит данных")
-            return False
+        # Получаем список колонок
+        pg_cursor.execute("SELECT * FROM bayut_properties LIMIT 0;")
+        column_names = [desc[0] for desc in pg_cursor.description]
+        columns_str = ", ".join(column_names)
+        placeholders = ", ".join(['?'] * len(column_names))
         
-        # Очищаем таблицу в SQLite перед вставкой новых данных
-        cursor = sqlite_conn.cursor()
-        cursor.execute(f"DELETE FROM {table_name}")
-        sqlite_conn.commit()
+        # Получаем общее количество записей
+        pg_cursor.execute("SELECT COUNT(*) FROM bayut_properties;")
+        total_records = pg_cursor.fetchone()[0]
+        logger.info(f"Всего записей для экспорта: {total_records}")
         
-        # Записываем данные в SQLite
-        df.to_sql(table_name, sqlite_conn, if_exists='append', index=False)
+        # Подключаемся к SQLite
+        sqlite_conn = sqlite3.connect(SQLITE_DB_PATH)
+        sqlite_cursor = sqlite_conn.cursor()
         
-        logger.info(f"Экспорт таблицы {table_name} завершен. Экспортировано {len(df)} записей.")
+        # Начинаем экспорт
+        start_time = time.time()
+        processed_records = 0
+        
+        for offset in range(0, total_records, batch_size):
+            # Получаем партию данных из PostgreSQL
+            pg_cursor.execute(f"SELECT * FROM bayut_properties LIMIT {batch_size} OFFSET {offset};")
+            batch_data = pg_cursor.fetchall()
+            
+            if not batch_data:
+                break
+            
+            # Конвертируем типы, несовместимые с SQLite
+            converted_batch = []
+            for row in batch_data:
+                converted_row = []
+                for value in row:
+                    # Преобразуем типы данных
+                    if value is None:
+                        converted_row.append(None)
+                    elif isinstance(value, (int, str, float, bool)):
+                        converted_row.append(value)
+                    elif hasattr(value, 'isoformat'):  # Даты и время
+                        converted_row.append(value.isoformat())
+                    else:  # Другие типы (включая Decimal)
+                        converted_row.append(str(value))
+                converted_batch.append(tuple(converted_row))
+            
+            # Вставляем данные в SQLite
+            sqlite_cursor.executemany(
+                f"INSERT INTO properties ({columns_str}) VALUES ({placeholders});", 
+                converted_batch
+            )
+            sqlite_conn.commit()
+            
+            processed_records += len(batch_data)
+            elapsed_time = time.time() - start_time
+            rate = processed_records / elapsed_time if elapsed_time > 0 else 0
+            
+            logger.info(f"Прогресс: {processed_records}/{total_records} записей ({processed_records/total_records*100:.1f}%), "
+                      f"скорость: {rate:.1f} записей/сек")
+        
+        # Закрываем соединения
+        pg_cursor.close()
+        pg_conn.close()
+        sqlite_cursor.close()
+        sqlite_conn.close()
+        
+        total_time = time.time() - start_time
+        logger.info(f"Экспорт завершен. Всего экспортировано {processed_records} записей за {total_time:.1f} секунд.")
         return True
     except Exception as e:
-        logger.error(f"Ошибка экспорта данных для таблицы {table_name}: {e}")
+        logger.error(f"Ошибка при экспорте данных: {e}")
+        return False
+
+def optimize_sqlite():
+    """Оптимизирует базу данных SQLite"""
+    try:
+        conn = sqlite3.connect(SQLITE_DB_PATH)
+        cursor = conn.cursor()
+        
+        # Получаем размер файла до оптимизации
+        file_size_before = os.path.getsize(SQLITE_DB_PATH) / (1024 * 1024)  # в МБ
+        
+        # Выполняем VACUUM для сжатия базы данных
+        logger.info("Выполняем VACUUM для оптимизации размера файла...")
+        cursor.execute("VACUUM;")
+        
+        # Анализируем таблицу для оптимизации запросов
+        logger.info("Выполняем ANALYZE для оптимизации запросов...")
+        cursor.execute("ANALYZE properties;")
+        
+        # Создаем индексы для ускорения поиска
+        logger.info("Создаем индексы...")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_properties_area ON properties(area);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_properties_property_type ON properties(property_type);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_properties_price ON properties(price);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_properties_size ON properties(size);")
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        # Получаем размер файла после оптимизации
+        file_size_after = os.path.getsize(SQLITE_DB_PATH) / (1024 * 1024)  # в МБ
+        
+        logger.info(f"Оптимизация завершена. Размер файла: {file_size_before:.2f} МБ -> {file_size_after:.2f} МБ")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка при оптимизации SQLite: {e}")
         return False
 
 def main():
-    """Основная функция экспорта данных"""
-    start_time = datetime.now()
-    logger.info(f"Начало экспорта данных из PostgreSQL в SQLite в {start_time}")
+    """Основная функция для выполнения экспорта"""
+    logger.info("Начало экспорта данных из PostgreSQL в SQLite")
     
-    # Подключение к базам данных
-    pg_conn = connect_to_postgres()
-    if not pg_conn:
-        logger.error("Не удалось подключиться к PostgreSQL. Экспорт отменен.")
+    # Получаем схему PostgreSQL
+    logger.info("Получение схемы PostgreSQL...")
+    schema = get_postgres_schema()
+    if not schema:
+        logger.error("Не удалось получить схему PostgreSQL. Экспорт отменен.")
         return False
     
-    sqlite_conn = create_sqlite_connection()
-    if not sqlite_conn:
-        logger.error("Не удалось создать базу SQLite. Экспорт отменен.")
-        pg_conn.close()
+    # Создаем схему SQLite
+    logger.info("Создание схемы SQLite...")
+    if not create_sqlite_schema(schema):
+        logger.error("Не удалось создать схему SQLite. Экспорт отменен.")
         return False
     
-    success = True
+    # Экспортируем данные
+    logger.info("Экспорт данных...")
+    if not export_data():
+        logger.error("Не удалось экспортировать данные. Экспорт отменен.")
+        return False
     
-    try:
-        # Обрабатываем каждую таблицу
-        for table_name in TABLES_TO_EXPORT:
-            # Получаем схему таблицы
-            schema_df = get_postgres_table_schema(pg_conn, table_name)
-            if schema_df is None:
-                logger.error(f"Не удалось получить схему таблицы {table_name}. Пропускаем.")
-                success = False
-                continue
-            
-            # Создаем таблицу в SQLite
-            if not create_sqlite_table(sqlite_conn, table_name, schema_df):
-                logger.error(f"Не удалось создать таблицу {table_name} в SQLite. Пропускаем.")
-                success = False
-                continue
-            
-            # Экспортируем данные
-            if not export_table_data(pg_conn, sqlite_conn, table_name):
-                logger.error(f"Не удалось экспортировать данные таблицы {table_name}. Пропускаем.")
-                success = False
-                continue
-                
-    except Exception as e:
-        logger.error(f"Необработанная ошибка при экспорте данных: {e}")
-        success = False
-    finally:
-        # Закрываем соединения
-        pg_conn.close()
-        sqlite_conn.close()
+    # Оптимизируем SQLite
+    logger.info("Оптимизация SQLite...")
+    if not optimize_sqlite():
+        logger.warning("Не удалось оптимизировать SQLite. Экспорт завершен, но база данных может быть не оптимальной.")
     
-    end_time = datetime.now()
-    duration = end_time - start_time
-    logger.info(f"Экспорт данных завершен в {end_time}. Длительность: {duration}")
-    
-    return success
+    logger.info("Экспорт успешно завершен!")
+    return True
 
 if __name__ == "__main__":
-    if main():
-        print("Экспорт данных успешно завершен")
-    else:
-        print("Экспорт данных завершен с ошибками. Смотрите лог для подробностей.") 
+    main() 

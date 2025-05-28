@@ -1,0 +1,1 @@
+Произошла ошибка при анализе данных: 'str' object has no attribute 'content'

@@ -1,278 +1,190 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import requests
 import folium
-from folium.plugins import MarkerCluster
-from streamlit_folium import st_folium
-import psycopg2
+from streamlit_folium import folium_static
+import plotly.express as px
+import plotly.graph_objects as go
 import os
-from datetime import datetime
+from dotenv import load_dotenv
 
-# Заголовок приложения
+# Загрузка переменных окружения
+load_dotenv()
+
+# Параметры API
+API_URL = os.getenv("API_URL", "http://localhost:8000")
+
 st.set_page_config(
-    page_title="Самые дешевые квартиры в Дубае",
+    page_title="Dubai Property Analysis",
     page_icon="🏢",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# Функция для подключения к БД
-def connect_to_db():
-    """Устанавливает соединение с базой данных PostgreSQL."""
+# Функция для получения данных из API
+@st.cache_data(ttl=300) # Кэшируем на 5 минут
+def fetch_data(endpoint, params=None):
     try:
-        # Получаем секреты из Streamlit Secrets
-        conn = psycopg2.connect(
-            dbname=st.secrets["postgres"]["DB_NAME"],
-            user=st.secrets["postgres"]["DB_USER"],
-            password=st.secrets["postgres"]["DB_PASSWORD"],
-            host=st.secrets["postgres"]["DB_HOST"],
-            port=st.secrets["postgres"]["DB_PORT"]
-        )
-        return conn
-    except Exception as e:
-        st.error(f"Ошибка подключения к БД: {e}")
-        return None
-
-# Функция для парсинга географических данных
-def parse_geography(geo_str):
-    """
-    Парсит строку геоданных 'Широта: ..., Долгота: ...' и возвращает широту и долготу.
-    Возвращает (None, None) если парсинг не удался.
-    """
-    if not isinstance(geo_str, str):
-        return None, None
-    try:
-        parts = geo_str.replace('Широта: ', '').replace(' Долгота: ', '').split(',')
-        if len(parts) == 2:
-            lat = float(parts[0].strip())
-            lng = float(parts[1].strip())
-            return lat, lng
-    except (ValueError, IndexError):
-        return None, None
-    return None, None
-
-# Функция для получения данных о самых дешевых квартирах
-def fetch_cheapest_apartments_by_region(conn):
-    """
-    Извлекает топ-3 самых дешевых квартир по каждому региону с площадью до 40 кв.м.
-    """
-    query = """
-    WITH ranked_apartments AS (
-        SELECT 
-            id, 
-            location, 
-            area, 
-            price, 
-            geography,
-            ROW_NUMBER() OVER (PARTITION BY location ORDER BY price ASC) as rank
-        FROM bayut_properties
-        WHERE area <= 40 AND price > 0
-    )
-    SELECT 
-        id, 
-        location, 
-        area, 
-        price, 
-        geography,
-        rank
-    FROM ranked_apartments
-    WHERE rank <= 3
-    ORDER BY location, rank
-    """
-    
-    try:
-        # Выполняем запрос
-        df = pd.read_sql_query(query, conn)
-        
-        if df.empty: 
-            st.error("Данные не найдены в БД.")
-            return None
-        
-        # Обрабатываем географические данные
-        df[['latitude', 'longitude']] = df['geography'].apply(lambda x: pd.Series(parse_geography(x)))
-        
-        # Удаляем строки без координат
-        df = df.dropna(subset=['latitude', 'longitude'])
-        
-        # Создаем URL-ссылки на объявления
-        df['url'] = df['id'].apply(lambda x: f"https://www.bayut.com/property/{x}/")
-        
-        return df
-    
-    except Exception as e:
-        st.error(f"Ошибка при извлечении данных из БД: {e}")
-        return None
-
-# Функция для создания интерактивной карты с Folium
-def create_interactive_map(df):
-    """
-    Создает интерактивную карту с маркерами для квартир.
-    """
-    # Создаем карту, центрированную по среднему значению координат
-    center_lat = df['latitude'].mean()
-    center_lon = df['longitude'].mean()
-    
-    m = folium.Map(location=[center_lat, center_lon], 
-                   zoom_start=11, 
-                   tiles='CartoDB positron')
-    
-    # Добавляем кластеры маркеров для лучшей производительности
-    marker_cluster = MarkerCluster().add_to(m)
-    
-    # Добавляем маркеры для каждой квартиры
-    for idx, row in df.iterrows():
-        # Создаем всплывающее окно (popup) с информацией о квартире
-        popup_html = f"""
-        <div style="width: 200px">
-            <h4>{row['location']}</h4>
-            <b>Цена:</b> {int(row['price']):,} AED<br>
-            <b>Площадь:</b> {row['area']:.1f} кв.м<br>
-            <b>Рейтинг:</b> #{row['rank']} в регионе<br>
-            <a href="{row['url']}" target="_blank">Открыть объявление</a>
-        </div>
-        """
-        
-        # Определяем цвет маркера в зависимости от ранга
-        color = 'green' if row['rank'] == 1 else 'blue' if row['rank'] == 2 else 'red'
-        
-        # Добавляем маркер на карту
-        folium.Marker(
-            location=[row['latitude'], row['longitude']],
-            popup=folium.Popup(popup_html, max_width=300),
-            tooltip=f"{row['location']}: {int(row['price']):,} AED",
-            icon=folium.Icon(color=color, icon='home', prefix='fa')
-        ).add_to(marker_cluster)
-    
-    return m
-
-# Функция для создания статистики по регионам
-def create_region_stats(df):
-    """
-    Создает статистику по регионам для отображения на боковой панели.
-    """
-    # Группируем данные по регионам и вычисляем статистику
-    region_stats = df.groupby('location').agg(
-        count=('id', 'count'),
-        min_price=('price', 'min'),
-        max_price=('price', 'max'),
-        avg_price=('price', 'mean')
-    ).reset_index()
-    
-    # Сортируем по минимальной цене
-    region_stats = region_stats.sort_values('min_price')
-    
-    return region_stats
-
-# Основная функция приложения
-def main():
-    st.title("🏢 Топ-3 самых дешевых квартир по регионам Дубая")
-    st.caption(f"Дата обновления: {datetime.now().strftime('%d.%m.%Y')}")
-    
-    # Демонстрационный режим при отсутствии подключения к БД
-    demo_mode = False
-    
-    # Подключаемся к БД
-    conn = connect_to_db()
-    if not conn:
-        st.warning("Подключение к базе данных недоступно. Показываю демонстрационные данные.")
-        demo_mode = True
-    
-    # Получаем данные или используем демо-данные
-    with st.spinner("Загрузка данных..."):
-        if demo_mode:
-            apartments_data = create_demo_data()
+        response = requests.get(f"{API_URL}{endpoint}", params=params)
+        if response.status_code == 200:
+            return response.json()
         else:
-            apartments_data = fetch_cheapest_apartments_by_region(conn)
-            # Закрываем соединение с БД если оно было установлено
-            conn.close()
-    
-    if apartments_data is None or apartments_data.empty:
-        st.error("Нет данных для отображения.")
-        return
-    
-    # Создаем двухколоночный макет
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        # Создаем и отображаем карту
-        st.subheader("Интерактивная карта")
-        st.caption("Маркеры: 🟢 - самая дешевая, 🔵 - вторая по цене, 🔴 - третья по цене")
-        
-        folium_map = create_interactive_map(apartments_data)
-        st_folium(folium_map, width=800, height=500)
-        
-        # Добавляем информацию о том, как пользоваться картой
-        with st.expander("Как пользоваться картой"):
-            st.markdown("""
-            - **Увеличить/уменьшить масштаб**: используйте колесо мыши или кнопки + и - в левом верхнем углу
-            - **Перемещение по карте**: удерживайте левую кнопку мыши и перетаскивайте карту
-            - **Информация о квартире**: нажмите на маркер, чтобы увидеть подробную информацию
-            - **Открыть объявление**: нажмите на ссылку "Открыть объявление" во всплывающем окне
-            """)
-    
-    with col2:
-        # Отображаем статистику по регионам
-        st.subheader("Топ-10 регионов с самыми низкими ценами")
-        
-        region_stats = create_region_stats(apartments_data)
-        
-        # Отображаем топ-10 регионов с самыми низкими ценами
-        for i, row in region_stats.head(10).iterrows():
-            with st.container():
-                st.markdown(f"**{i+1}. {row['location']}**")
-                st.markdown(f"Мин. цена: **{int(row['min_price']):,} AED**")
-                st.markdown(f"Средняя цена: {int(row['avg_price']):,} AED")
-                st.markdown("---")
-    
-    # Добавляем таблицу со всеми данными
-    st.subheader("Все квартиры")
-    
-    # Подготовка данных для таблицы
-    table_data = apartments_data[['location', 'price', 'area', 'rank', 'url']].copy()
-    table_data['price'] = table_data['price'].apply(lambda x: f"{int(x):,} AED")
-    table_data['area'] = table_data['area'].apply(lambda x: f"{x:.1f} кв.м")
-    table_data['rank'] = table_data['rank'].apply(lambda x: f"#{x}")
-    
-    # Переименовываем столбцы для отображения
-    table_data.columns = ['Регион', 'Цена', 'Площадь', 'Рейтинг', 'Ссылка']
-    
-    # Создаем ссылки для последнего столбца
-    table_data['Ссылка'] = table_data['Ссылка'].apply(lambda x: f'<a href="{x}" target="_blank">Перейти</a>')
-    
-    # Отображаем таблицу с возможностью сортировки и фильтрации
-    st.dataframe(
-        table_data,
-        column_config={
-            "Ссылка": st.column_config.LinkColumn()
-        },
-        hide_index=True,
-        use_container_width=True
-    )
-    
-    # Добавляем информацию о проекте
-    st.markdown("---")
-    st.caption("© 2025 Wealth Compass | Анализ рынка недвижимости в Дубае")
+            st.error(f"Ошибка получения данных: {response.status_code}")
+            return None
+    except Exception as e:
+        st.error(f"Ошибка подключения к API: {e}")
+        return None
 
-# Функция для создания демонстрационных данных
-def create_demo_data():
-    """Создает демонстрационные данные для отображения, когда нет подключения к БД."""
-    # Создаем фрейм данных с примерными данными о квартирах
-    data = {
-        'id': [f'demo-{i}' for i in range(1, 31)],
-        'location': ['Dubai Marina', 'JVC', 'Business Bay', 'DAMAC Hills', 'Dubai South', 
-                    'Sports City', 'JLT', 'Downtown Dubai', 'Arjan', 'Silicon Oasis'] * 3,
-        'price': [250000, 280000, 300000, 320000, 340000, 360000, 380000, 400000, 420000, 440000] * 3,
-        'area': [30 + i for i in range(30)],
-        'rank': [1, 2, 3] * 10,
-        'latitude': [25.05 + (i * 0.01) for i in range(30)],
-        'longitude': [55.15 + (i * 0.01) for i in range(30)],
-    }
+def main():
+    st.title("Анализ недвижимости в Дубае")
     
-    df = pd.DataFrame(data)
+    # Боковая панель
+    st.sidebar.header("Параметры")
     
-    # Добавляем URL (демонстрационные)
-    df['url'] = df['id'].apply(lambda x: f"https://www.example.com/property/{x}/")
+    # Главные вкладки
+    tab1, tab2, tab3 = st.tabs(["Карта", "Статистика", "Список объектов"])
     
-    return df
+    with tab1:
+        st.header("Карта объектов недвижимости")
+        
+        # Получаем данные для карты
+        map_data = fetch_data("/api/map_data")
+        
+        if map_data:
+            # Создаем карту с кластеризацией
+            dubai_map = folium.Map(location=[25.2048, 55.2708], zoom_start=11)
+            
+            # Добавляем маркеры
+            for item in map_data:
+                if item.get('latitude') and item.get('longitude'):
+                    # Форматируем всплывающее окно
+                    popup_text = f"""
+                    <b>{item.get('title', 'Без названия')}</b><br>
+                    Цена: {item.get('price', 'Н/Д')} AED<br>
+                    Район: {item.get('area', 'Н/Д')}<br>
+                    Тип: {item.get('property_type', 'Н/Д')}<br>
+                    <a href="?property_id={item.get('id')}" target="_blank">Подробнее</a>
+                    """
+                    
+                    folium.Marker(
+                        location=[item['latitude'], item['longitude']],
+                        popup=folium.Popup(popup_text, max_width=300),
+                        tooltip=f"{item.get('title', 'Объект')} - {item.get('price', 'Н/Д')} AED",
+                        icon=folium.Icon(icon="home", prefix="fa")
+                    ).add_to(dubai_map)
+            
+            # Отображаем карту
+            folium_static(dubai_map, width=1200, height=600)
+        else:
+            st.warning("Не удалось загрузить данные для карты")
+    
+    with tab2:
+        st.header("Статистика по недвижимости")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Средняя цена по районам
+            avg_price_by_area = fetch_data("/api/stats/avg_price_by_area")
+            
+            if avg_price_by_area:
+                df_area = pd.DataFrame(avg_price_by_area)
+                df_area = df_area.sort_values(by='avg_price', ascending=False).head(10)
+                
+                fig = px.bar(
+                    df_area, 
+                    x='area', 
+                    y='avg_price',
+                    color='avg_price',
+                    labels={'area': 'Район', 'avg_price': 'Средняя цена (AED)'},
+                    title='Топ-10 районов по средней цене'
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Не удалось загрузить статистику по районам")
+        
+        with col2:
+            # Количество объектов по типу
+            count_by_type = fetch_data("/api/stats/count_by_property_type")
+            
+            if count_by_type:
+                df_type = pd.DataFrame(count_by_type)
+                
+                fig = px.pie(
+                    df_type, 
+                    values='count', 
+                    names='property_type', 
+                    title='Распределение по типам недвижимости'
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Не удалось загрузить статистику по типам недвижимости")
+    
+    with tab3:
+        st.header("Список объектов недвижимости")
+        
+        # Параметры пагинации
+        page = st.sidebar.number_input("Страница", min_value=1, value=1)
+        limit = st.sidebar.selectbox("Объектов на странице", [10, 25, 50, 100], index=1)
+        offset = (page - 1) * limit
+        
+        # Получаем список объектов
+        properties = fetch_data("/api/properties", params={"limit": limit, "offset": offset})
+        
+        if properties and 'data' in properties:
+            # Отображаем таблицу
+            df_properties = pd.DataFrame(properties['data'])
+            
+            if not df_properties.empty:
+                # Выбираем только нужные колонки для отображения
+                display_columns = ['id', 'title', 'price', 'area', 'property_type', 'bedrooms', 'bathrooms']
+                df_display = df_properties[display_columns] if all(col in df_properties.columns for col in display_columns) else df_properties
+                
+                st.dataframe(df_display, use_container_width=True)
+                
+                # Информация о пагинации
+                st.info(f"Показано {len(properties['data'])} из {properties['total']} объектов. Страница {page} из {(properties['total'] // limit) + 1}")
+            else:
+                st.warning("Нет данных для отображения")
+        else:
+            st.warning("Не удалось загрузить список объектов")
+
+    # Проверяем, есть ли запрос на просмотр детальной информации
+    property_id = st.query_params.get("property_id")
+    if property_id:
+        property_details = fetch_data(f"/api/properties/{property_id}")
+        if property_details:
+            st.subheader(f"Детали объекта: {property_details.get('title', 'Без названия')}")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write(f"**Цена:** {property_details.get('price', 'Н/Д')} AED")
+                st.write(f"**Район:** {property_details.get('area', 'Н/Д')}")
+                st.write(f"**Тип недвижимости:** {property_details.get('property_type', 'Н/Д')}")
+                st.write(f"**Спальни:** {property_details.get('bedrooms', 'Н/Д')}")
+                st.write(f"**Ванные:** {property_details.get('bathrooms', 'Н/Д')}")
+            
+            with col2:
+                st.write(f"**Площадь:** {property_details.get('size', 'Н/Д')} кв.м.")
+                st.write(f"**Статус:** {property_details.get('status', 'Н/Д')}")
+                
+                # Если есть координаты, показываем маленькую карту
+                if property_details.get('latitude') and property_details.get('longitude'):
+                    property_map = folium.Map(
+                        location=[property_details['latitude'], property_details['longitude']], 
+                        zoom_start=15
+                    )
+                    
+                    folium.Marker(
+                        location=[property_details['latitude'], property_details['longitude']],
+                        popup=property_details.get('title', 'Объект'),
+                        icon=folium.Icon(icon="home", prefix="fa")
+                    ).add_to(property_map)
+                    
+                    folium_static(property_map, width=400, height=300)
 
 if __name__ == "__main__":
     main() 
