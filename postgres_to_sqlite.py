@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 import time
 import logging
 from datetime import datetime
+import json
 
 # Настройка логирования
 log_dir = "logs"
@@ -173,9 +174,13 @@ def export_data(batch_size=1000):
         )
         pg_cursor = pg_conn.cursor()
         
-        # Получаем список колонок
+        # Получаем список колонок и их имен
         pg_cursor.execute("SELECT * FROM bayut_properties LIMIT 0;")
-        column_names = [desc[0] for desc in pg_cursor.description]
+        
+        # Получаем имена колонок и сохраняем их позицию
+        column_info = {desc[0]: i for i, desc in enumerate(pg_cursor.description)}
+        column_names = list(column_info.keys()) # Упорядоченный список имен колонок
+        
         columns_str = ", ".join(column_names)
         placeholders = ", ".join(['?'] * len(column_names))
         
@@ -204,9 +209,31 @@ def export_data(batch_size=1000):
             converted_batch = []
             for row in batch_data:
                 converted_row = []
-                for value in row:
-                    # Преобразуем типы данных
-                    if value is None:
+                for i, value in enumerate(row):
+                    col_name = column_names[i] # Получаем имя текущей колонки
+
+                    if col_name == 'geography':
+                        if isinstance(value, dict): # Если это уже словарь (из JSON/JSONB)
+                            # Убедимся, что есть ключи lat и lng, иначе пишем NULL
+                            if 'lat' in value and 'lng' in value and value['lat'] is not None and value['lng'] is not None:
+                                converted_row.append(json.dumps(value))
+                            else:
+                                converted_row.append(None) # Неполные или отсутствующие координаты
+                        elif isinstance(value, str): # Если это строка
+                            try:
+                                # Попытка распарсить и проверить структуру
+                                parsed_json = json.loads(value)
+                                if isinstance(parsed_json, dict) and 'lat' in parsed_json and 'lng' in parsed_json and parsed_json['lat'] is not None and parsed_json['lng'] is not None:
+                                    converted_row.append(value) # Строка уже валидный JSON с нужными полями
+                                else:
+                                    converted_row.append(None) # Валидный JSON, но не той структуры
+                            except json.JSONDecodeError:
+                                converted_row.append(None) # Невалидный JSON
+                        elif value is None:
+                            converted_row.append(None)
+                        else: # Другие типы для geography - маловероятно, но на всякий случай
+                            converted_row.append(None)
+                    elif value is None:
                         converted_row.append(None)
                     elif isinstance(value, (int, str, float, bool)):
                         converted_row.append(value)
