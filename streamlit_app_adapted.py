@@ -265,7 +265,7 @@ def main():
             count_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties;", conn)
             record_count = count_df.iloc[0]['count']
             
-            # Проверяем наличие координат
+            # Проверяем наличие координат - изменяем запрос, убираем json_extract
             coords_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties WHERE geography IS NOT NULL;", conn)
             coords_count = coords_df.iloc[0]['count']
             
