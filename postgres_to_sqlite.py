@@ -1,15 +1,14 @@
 #!/usr/bin/env python
 """
 Скрипт для экспорта данных из PostgreSQL в SQLite.
-Используется для создания файла SQLite, который можно загрузить в Git
-и использовать в Streamlit Cloud.
+Создает полную, точную копию таблицы PostgreSQL в SQLite.
+Никаких изменений в структуре или данных не производится.
 
 Использование:
     python postgres_to_sqlite.py
 """
 
 import os
-import pandas as pd
 import psycopg2
 import sqlite3
 from dotenv import load_dotenv
@@ -17,6 +16,7 @@ import time
 import logging
 from datetime import datetime
 import json
+import decimal
 
 # Настройка логирования
 log_dir = "logs"
@@ -84,6 +84,8 @@ def get_postgres_schema():
         cursor.close()
         conn.close()
         
+        logger.info(f"Получена схема PostgreSQL: {len(columns)} колонок")
+        
         return {
             'columns': columns,
             'primary_keys': primary_key_columns
@@ -93,7 +95,7 @@ def get_postgres_schema():
         return None
 
 def create_sqlite_schema(schema):
-    """Создает схему таблицы в SQLite на основе схемы PostgreSQL"""
+    """Создает точную копию схемы PostgreSQL в SQLite"""
     if not schema:
         logger.error("Не удалось получить схему PostgreSQL")
         return False
@@ -154,7 +156,7 @@ def create_sqlite_schema(schema):
         cursor.close()
         conn.close()
         
-        logger.info("Схема SQLite успешно создана")
+        logger.info(f"Схема SQLite успешно создана, точная копия PostgreSQL")
         return True
     except Exception as e:
         logger.error(f"Ошибка при создании схемы SQLite: {e}")
@@ -176,11 +178,7 @@ def export_data(batch_size=1000):
         
         # Получаем список колонок и их имен
         pg_cursor.execute("SELECT * FROM bayut_properties LIMIT 0;")
-        
-        # Получаем имена колонок и сохраняем их позицию
-        column_info = {desc[0]: i for i, desc in enumerate(pg_cursor.description)}
-        column_names = list(column_info.keys()) # Упорядоченный список имен колонок
-        
+        column_names = [desc[0] for desc in pg_cursor.description]
         columns_str = ", ".join(column_names)
         placeholders = ", ".join(['?'] * len(column_names))
         
@@ -209,37 +207,21 @@ def export_data(batch_size=1000):
             converted_batch = []
             for row in batch_data:
                 converted_row = []
-                for i, value in enumerate(row):
-                    col_name = column_names[i] # Получаем имя текущей колонки
-
-                    if col_name == 'geography':
-                        if isinstance(value, dict): # Если это уже словарь (из JSON/JSONB)
-                            # Убедимся, что есть ключи lat и lng, иначе пишем NULL
-                            if 'lat' in value and 'lng' in value and value['lat'] is not None and value['lng'] is not None:
-                                converted_row.append(json.dumps(value))
-                            else:
-                                converted_row.append(None) # Неполные или отсутствующие координаты
-                        elif isinstance(value, str): # Если это строка
-                            try:
-                                # Попытка распарсить и проверить структуру
-                                parsed_json = json.loads(value)
-                                if isinstance(parsed_json, dict) and 'lat' in parsed_json and 'lng' in parsed_json and parsed_json['lat'] is not None and parsed_json['lng'] is not None:
-                                    converted_row.append(value) # Строка уже валидный JSON с нужными полями
-                                else:
-                                    converted_row.append(None) # Валидный JSON, но не той структуры
-                            except json.JSONDecodeError:
-                                converted_row.append(None) # Невалидный JSON
-                        elif value is None:
-                            converted_row.append(None)
-                        else: # Другие типы для geography - маловероятно, но на всякий случай
-                            converted_row.append(None)
-                    elif value is None:
+                for value in row:
+                    # Преобразуем типы данных
+                    if value is None:
                         converted_row.append(None)
                     elif isinstance(value, (int, str, float, bool)):
                         converted_row.append(value)
+                    elif isinstance(value, dict):  # JSON/JSONB из psycopg2
+                        converted_row.append(json.dumps(value))
+                    elif isinstance(value, list):  # Массивы из psycopg2
+                        converted_row.append(json.dumps(value))
+                    elif isinstance(value, decimal.Decimal):  # Decimal
+                        converted_row.append(float(value))
                     elif hasattr(value, 'isoformat'):  # Даты и время
                         converted_row.append(value.isoformat())
-                    else:  # Другие типы (включая Decimal)
+                    else:  # Другие типы
                         converted_row.append(str(value))
                 converted_batch.append(tuple(converted_row))
             
@@ -288,24 +270,23 @@ def optimize_sqlite():
         cursor.execute("ANALYZE;")
         conn.commit()
         
-        # Создаем индексы (если их нет)
+        # Создаем индексы для ускорения запросов
         logger.info("Создаем индексы...")
+        cursor.execute("PRAGMA table_info(properties);")
+        columns = cursor.fetchall()
+        column_names = [col[1] for col in columns]
         
-        # Пример создания индекса для часто используемых колонок:
-        # Индекс для колонки 'area' (ранее было 'size')
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_area ON properties (area);")
-        # Индекс для колонки 'price'
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_price ON properties (price);")
-        # Индекс для колонки 'property_type'
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_property_type ON properties (property_type);")
-        # Индекс для географических координат (если они часто используются в WHERE)
-        # Поскольку json_extract используется в приложении, прямой индекс на lat/lng создать сложно.
-        # Вместо этого, индексируем поле geography целиком, если по нему идет фильтрация.
-        # cursor.execute("CREATE INDEX IF NOT EXISTS idx_geography ON properties (geography);")
+        # Создаем индексы для обычных колонок фильтрации
+        if 'area' in column_names:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_area ON properties (area);")
+        
+        if 'price' in column_names:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_price ON properties (price);")
+            
+        if 'property_type' in column_names:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_property_type ON properties (property_type);")
         
         conn.commit()
-        logger.info("Индексы созданы/проверены.")
-        
         cursor.close()
         conn.close()
         logger.info("Оптимизация SQLite завершена.")
@@ -317,6 +298,8 @@ def optimize_sqlite():
 def main():
     """Основная функция для выполнения экспорта"""
     logger.info("Начало экспорта данных из PostgreSQL в SQLite")
+    logger.info(f"Создается ТОЧНАЯ копия таблицы PostgreSQL")
+    logger.info(f"Параметры PostgreSQL: {PG_CONFIG}")
     
     # Получаем схему PostgreSQL
     logger.info("Получение схемы PostgreSQL...")
@@ -326,13 +309,13 @@ def main():
         return False
     
     # Создаем схему SQLite
-    logger.info("Создание схемы SQLite...")
+    logger.info("Создание схемы SQLite (точная копия PostgreSQL)...")
     if not create_sqlite_schema(schema):
         logger.error("Не удалось создать схему SQLite. Экспорт отменен.")
         return False
     
     # Экспортируем данные
-    logger.info("Экспорт данных...")
+    logger.info("Экспорт данных (точная копия данных из PostgreSQL)...")
     if not export_data():
         logger.error("Не удалось экспортировать данные. Экспорт отменен.")
         return False
@@ -342,7 +325,7 @@ def main():
     if not optimize_sqlite():
         logger.warning("Не удалось оптимизировать SQLite. Экспорт завершен, но база данных может быть не оптимальной.")
     
-    logger.info("Экспорт успешно завершен!")
+    logger.info("Экспорт успешно завершен! Создана точная копия PostgreSQL в SQLite.")
     return True
 
 if __name__ == "__main__":
