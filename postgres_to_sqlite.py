@@ -249,32 +249,39 @@ def optimize_sqlite():
         conn = sqlite3.connect(SQLITE_DB_PATH)
         cursor = conn.cursor()
         
-        # Получаем размер файла до оптимизации
-        file_size_before = os.path.getsize(SQLITE_DB_PATH) / (1024 * 1024)  # в МБ
+        logger.info("Оптимизация SQLite...")
         
-        # Выполняем VACUUM для сжатия базы данных
+        # VACUUM
         logger.info("Выполняем VACUUM для оптимизации размера файла...")
         cursor.execute("VACUUM;")
+        conn.commit()
         
-        # Анализируем таблицу для оптимизации запросов
+        # ANALYZE
         logger.info("Выполняем ANALYZE для оптимизации запросов...")
-        cursor.execute("ANALYZE properties;")
+        cursor.execute("ANALYZE;")
+        conn.commit()
         
-        # Создаем индексы для ускорения поиска
+        # Создаем индексы (если их нет)
         logger.info("Создаем индексы...")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_properties_area ON properties(area);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_properties_property_type ON properties(property_type);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_properties_price ON properties(price);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_properties_size ON properties(size);")
+        
+        # Пример создания индекса для часто используемых колонок:
+        # Индекс для колонки 'area' (ранее было 'size')
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_area ON properties (area);")
+        # Индекс для колонки 'price'
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_price ON properties (price);")
+        # Индекс для колонки 'property_type'
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_property_type ON properties (property_type);")
+        # Индекс для географических координат (если они часто используются в WHERE)
+        # Поскольку json_extract используется в приложении, прямой индекс на lat/lng создать сложно.
+        # Вместо этого, индексируем поле geography целиком, если по нему идет фильтрация.
+        # cursor.execute("CREATE INDEX IF NOT EXISTS idx_geography ON properties (geography);")
         
         conn.commit()
+        logger.info("Индексы созданы/проверены.")
+        
         cursor.close()
         conn.close()
-        
-        # Получаем размер файла после оптимизации
-        file_size_after = os.path.getsize(SQLITE_DB_PATH) / (1024 * 1024)  # в МБ
-        
-        logger.info(f"Оптимизация завершена. Размер файла: {file_size_before:.2f} МБ -> {file_size_after:.2f} МБ")
+        logger.info("Оптимизация SQLite завершена.")
         return True
     except Exception as e:
         logger.error(f"Ошибка при оптимизации SQLite: {e}")

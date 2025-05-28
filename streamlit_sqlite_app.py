@@ -59,7 +59,7 @@ def get_properties(limit=100, offset=0, max_size=None):
     params = []
     
     if max_size is not None:
-        conditions.append("size <= ?")
+        conditions.append("area <= ?")
         params.append(max_size)
     
     if conditions:
@@ -98,7 +98,7 @@ def get_cheapest_properties_by_area(top_n=3, max_size=None):
     
     params = []
     if max_size is not None:
-        query += " AND size <= ?"
+        query += " AND area <= ?"
         params.append(max_size)
     
     query += f"""
@@ -144,14 +144,16 @@ def get_count_by_property_type():
 def get_map_data(max_size=None):
     """Получает данные для отображения на карте с фильтрацией по площади"""
     query = """
-    SELECT id, title, price, area, property_type, size, bedrooms, bathrooms, latitude, longitude 
+    SELECT id, title, price, area, property_type, area as size, bedrooms, bathrooms, 
+           json_extract(geography, '$.lat') as latitude, 
+           json_extract(geography, '$.lng') as longitude 
     FROM properties
-    WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+    WHERE json_extract(geography, '$.lat') IS NOT NULL AND json_extract(geography, '$.lng') IS NOT NULL
     """
     
     params = []
     if max_size is not None:
-        query += " AND size <= ?"
+        query += " AND area <= ?"
         params.append(max_size)
     
     return execute_query(query, params=tuple(params) if params else None)
@@ -183,7 +185,8 @@ def main():
     
     try:
         db_size = os.path.getsize(SQLITE_DB_PATH) / (1024 * 1024)  # Размер в МБ
-        st.sidebar.info(f"База данных: {SQLITE_DB_PATH}\nРазмер: {db_size:.2f} МБ")
+        db_modified = datetime.fromtimestamp(os.path.getmtime(SQLITE_DB_PATH))
+        st.sidebar.info(f"База данных: {os.path.basename(SQLITE_DB_PATH)}\nРазмер: {db_size:.2f} МБ\nПоследнее обновление: {db_modified.strftime('%d.%m.%Y %H:%M')}")
         
         # Проверяем доступность базы данных
         conn = get_db_connection()
@@ -204,14 +207,14 @@ def main():
             count_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties;", conn)
             record_count = count_df.iloc[0]['count']
             
-            # Проверяем наличие координат
-            coords_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties WHERE latitude IS NOT NULL AND longitude IS NOT NULL;", conn)
+            # Проверяем наличие координат (используем json_extract)
+            coords_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties WHERE json_extract(geography, '$.lat') IS NOT NULL AND json_extract(geography, '$.lng') IS NOT NULL;", conn)
             coords_count = coords_df.iloc[0]['count']
             
             st.sidebar.info(f"Всего записей: {record_count}\nЗаписей с координатами: {coords_count}")
             
-            if coords_count == 0:
-                st.warning("В базе данных нет записей с координатами. Карта не может быть отображена.")
+            if coords_count == 0 and record_count > 0:
+                st.sidebar.warning("В базе данных нет записей с корректными координатами (поле 'geography'). Карта не может быть отображена.")
         except Exception as db_error:
             st.error(f"Ошибка при проверке структуры базы данных: {db_error}")
         finally:
