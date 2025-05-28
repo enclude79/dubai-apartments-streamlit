@@ -7,8 +7,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import os
 from datetime import datetime
-import random
-import numpy as np
 import colorsys
 import re
 
@@ -52,6 +50,22 @@ def execute_query(query, params=None):
         st.error(f"Ошибка выполнения запроса: {e}")
         return None
 
+def extract_coordinates(geo_str):
+    """Извлекает координаты из строки формата 'Широта: X, Долгота: Y'"""
+    if not isinstance(geo_str, str):
+        return None, None
+    
+    lat_pattern = r'Широта:\s*([\d\.]+)'
+    lng_pattern = r'Долгота:\s*([\d\.]+)'
+    
+    lat_match = re.search(lat_pattern, geo_str)
+    lng_match = re.search(lng_pattern, geo_str)
+    
+    lat = float(lat_match.group(1)) if lat_match else None
+    lng = float(lng_match.group(1)) if lng_match else None
+    
+    return lat, lng
+
 def get_properties(limit=100, offset=0, max_size=None):
     """Получает список объектов недвижимости с пагинацией и фильтрацией по площади"""
     base_query = "SELECT * FROM properties"
@@ -92,7 +106,7 @@ def get_cheapest_properties_by_area(top_n=3, max_size=None):
     WITH RankedProperties AS (
         SELECT 
             *,
-            ROW_NUMBER() OVER (PARTITION BY area ORDER BY price) as price_rank
+            ROW_NUMBER() OVER (PARTITION BY location ORDER BY price) as price_rank
         FROM properties
         WHERE 1=1
     """
@@ -106,11 +120,22 @@ def get_cheapest_properties_by_area(top_n=3, max_size=None):
     )
     SELECT * FROM RankedProperties
     WHERE price_rank <= ?
-    ORDER BY area, price_rank
+    ORDER BY location, price_rank
     """
     params.append(top_n)
     
-    return execute_query(query, params=tuple(params))
+    df = execute_query(query, params=tuple(params))
+    
+    # Переименовываем колонки для совместимости
+    if df is not None:
+        if 'rooms' in df.columns:
+            df['bedrooms'] = df['rooms']
+        if 'baths' in df.columns:
+            df['bathrooms'] = df['baths']
+        if 'location' in df.columns:
+            df['area'] = df['location']
+    
+    return df
 
 def get_property(property_id):
     """Получает детальную информацию об объекте недвижимости по ID"""
@@ -118,16 +143,32 @@ def get_property(property_id):
     df = execute_query(query, params=(property_id,))
     
     if df is not None and not df.empty:
-        return df.iloc[0].to_dict()
+        property_dict = df.iloc[0].to_dict()
+        
+        # Добавляем координаты, если есть geography
+        if 'geography' in property_dict and property_dict['geography']:
+            lat, lng = extract_coordinates(property_dict['geography'])
+            property_dict['latitude'] = lat
+            property_dict['longitude'] = lng
+        
+        # Переименовываем поля для совместимости
+        if 'rooms' in property_dict:
+            property_dict['bedrooms'] = property_dict['rooms']
+        if 'baths' in property_dict:
+            property_dict['bathrooms'] = property_dict['baths']
+        if 'location' in property_dict:
+            property_dict['area'] = property_dict['location']
+        
+        return property_dict
     
     return None
 
 def get_avg_price_by_area():
     """Получает среднюю цену по районам"""
     query = """
-    SELECT area, AVG(price) as avg_price, COUNT(*) as count
+    SELECT location as area, AVG(price) as avg_price, COUNT(*) as count
     FROM properties
-    GROUP BY area
+    GROUP BY location
     ORDER BY avg_price DESC
     """
     return execute_query(query)
@@ -145,7 +186,7 @@ def get_count_by_property_type():
 def get_map_data(max_size=None):
     """Получает данные для отображения на карте с фильтрацией по площади"""
     query = """
-    SELECT id, title, price, area, property_type, area as size, rooms as bedrooms, baths as bathrooms, 
+    SELECT id, title, price, location as area, property_type, area as size, rooms as bedrooms, baths as bathrooms, 
            geography
     FROM properties
     WHERE geography IS NOT NULL
@@ -160,22 +201,6 @@ def get_map_data(max_size=None):
     
     # Преобразуем строки с координатами в нужный формат
     if df is not None and not df.empty:
-        # Извлекаем latitude и longitude из строки формата "Широта: X, Долгота: Y"
-        def extract_coordinates(geo_str):
-            if not isinstance(geo_str, str):
-                return None, None
-            
-            lat_pattern = r'Широта:\s*([\d\.]+)'
-            lng_pattern = r'Долгота:\s*([\d\.]+)'
-            
-            lat_match = re.search(lat_pattern, geo_str)
-            lng_match = re.search(lng_pattern, geo_str)
-            
-            lat = float(lat_match.group(1)) if lat_match else None
-            lng = float(lng_match.group(1)) if lng_match else None
-            
-            return lat, lng
-        
         # Применяем функцию к столбцу geography
         df['latitude'] = None
         df['longitude'] = None
@@ -240,14 +265,14 @@ def main():
             count_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties;", conn)
             record_count = count_df.iloc[0]['count']
             
-            # Проверяем наличие координат (используем json_extract)
-            coords_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties WHERE json_extract(geography, '$.lat') IS NOT NULL AND json_extract(geography, '$.lng') IS NOT NULL;", conn)
+            # Проверяем наличие координат
+            coords_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties WHERE geography IS NOT NULL;", conn)
             coords_count = coords_df.iloc[0]['count']
             
             st.sidebar.info(f"Всего записей: {record_count}\nЗаписей с координатами: {coords_count}")
             
             if coords_count == 0 and record_count > 0:
-                st.sidebar.warning("В базе данных нет записей с корректными координатами (поле 'geography'). Карта не может быть отображена.")
+                st.sidebar.warning("В базе данных нет записей с координатами (поле 'geography'). Карта не может быть отображена.")
         except Exception as db_error:
             st.error(f"Ошибка при проверке структуры базы данных: {db_error}")
         finally:
@@ -383,32 +408,6 @@ def main():
                 st.warning("Не удалось загрузить данные для карты")
         except Exception as e:
             st.error(f"Критическая ошибка при загрузке карты: {e}")
-            
-            # Проверяем файл базы данных
-            db_exists = os.path.isfile(SQLITE_DB_PATH)
-            if not db_exists:
-                st.error(f"База данных {SQLITE_DB_PATH} не найдена!")
-            else:
-                st.info(f"База данных существует. Размер: {os.path.getsize(SQLITE_DB_PATH) / 1024:.2f} КБ")
-                
-                # Проверяем содержимое базы данных
-                try:
-                    conn = get_db_connection()
-                    if conn:
-                        tables_df = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table';", conn)
-                        st.write("Таблицы в базе данных:", tables_df)
-                        
-                        if 'properties' in tables_df['name'].values:
-                            count_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties;", conn)
-                            st.write(f"Количество записей в таблице properties: {count_df.iloc[0]['count']}")
-                            
-                            # Проверяем наличие координат
-                            coords_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties WHERE latitude IS NOT NULL AND longitude IS NOT NULL;", conn)
-                            st.write(f"Записей с координатами: {coords_df.iloc[0]['count']}")
-                        
-                        conn.close()
-                except Exception as db_error:
-                    st.error(f"Ошибка при проверке базы данных: {db_error}")
     
     with tab2:
         st.header("Самые недорогие квартиры по районам")
@@ -448,8 +447,12 @@ def main():
             # Отображаем таблицу с деталями
             st.subheader("Детали недорогих квартир")
             display_columns = ['title', 'area', 'price', 'size', 'bedrooms', 'bathrooms', 'property_type']
+            
+            # Проверяем наличие всех колонок
+            available_columns = [col for col in display_columns if col in cheapest_df.columns]
+            
             st.dataframe(
-                cheapest_df[display_columns],
+                cheapest_df[available_columns],
                 column_config={
                     "title": "Название",
                     "area": "Район",
@@ -522,9 +525,21 @@ def main():
             df_properties = properties_result['data']
             
             if not df_properties.empty:
+                # Преобразуем названия колонок для отображения
+                if 'rooms' in df_properties.columns:
+                    df_properties['bedrooms'] = df_properties['rooms']
+                if 'baths' in df_properties.columns:
+                    df_properties['bathrooms'] = df_properties['baths']
+                if 'location' in df_properties.columns:
+                    df_properties['area'] = df_properties['location']
+                
                 # Выбираем только нужные колонки для отображения
-                display_columns = ['id', 'title', 'price', 'area', 'size', 'property_type', 'bedrooms', 'bathrooms']
-                df_display = df_properties[display_columns] if all(col in df_properties.columns for col in display_columns) else df_properties
+                display_columns = ['id', 'title', 'price', 'area', 'area', 'property_type', 'bedrooms', 'bathrooms']
+                
+                # Проверяем наличие всех колонок
+                available_columns = [col for col in display_columns if col in df_properties.columns]
+                
+                df_display = df_properties[available_columns]
                 
                 st.dataframe(
                     df_display,
@@ -532,7 +547,7 @@ def main():
                         "title": "Название",
                         "price": st.column_config.NumberColumn("Цена (AED)", format="%.0f"),
                         "area": "Район",
-                        "size": st.column_config.NumberColumn("Площадь (кв.м.)", format="%.1f"),
+                        "area": st.column_config.NumberColumn("Площадь (кв.м.)", format="%.1f"),
                         "property_type": "Тип недвижимости",
                         "bedrooms": "Спальни",
                         "bathrooms": "Ванные"
@@ -567,11 +582,11 @@ def main():
                 st.write(f"**Ванные:** {property_details.get('bathrooms', 'Н/Д')}")
             
             with col2:
-                st.write(f"**Площадь:** {property_details.get('size', 'Н/Д')} кв.м.")
+                st.write(f"**Площадь:** {property_details.get('area', 'Н/Д')} кв.м.")
                 st.write(f"**Статус:** {property_details.get('status', 'Н/Д')}")
                 
                 # Если есть координаты, показываем маленькую карту
-                if pd.notna(property_details.get('latitude')) and pd.notna(property_details.get('longitude')):
+                if 'latitude' in property_details and pd.notna(property_details.get('latitude')) and pd.notna(property_details.get('longitude')):
                     property_map = folium.Map(
                         location=[property_details['latitude'], property_details['longitude']], 
                         zoom_start=15
