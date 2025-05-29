@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import folium
+from folium.plugins import MarkerCluster
 from streamlit_folium import folium_static
 import plotly.express as px
 import plotly.graph_objects as go
@@ -9,6 +10,7 @@ import os
 from datetime import datetime
 import colorsys
 import re
+import traceback
 
 # Путь к SQLite базе данных
 SQLITE_DB_PATH = "dubai_properties.db"
@@ -61,8 +63,13 @@ def extract_coordinates(geo_str):
     lat_match = re.search(lat_pattern, geo_str)
     lng_match = re.search(lng_pattern, geo_str)
     
-    lat = float(lat_match.group(1)) if lat_match else None
-    lng = float(lng_match.group(1)) if lng_match else None
+    # Явное преобразование в float
+    try:
+        lat = float(lat_match.group(1)) if lat_match else None
+        lng = float(lng_match.group(1)) if lng_match else None
+    except (ValueError, TypeError) as e:
+        print(f"Ошибка преобразования координат: {e}, исходная строка: {geo_str}")
+        return None, None
     
     return lat, lng
 
@@ -100,25 +107,29 @@ def get_properties(limit=100, offset=0, max_size=None):
         "offset": offset
     }
 
-def get_cheapest_properties_by_area(top_n=3, max_size=None):
+def get_cheapest_properties_by_area(top_n=3, min_size=None, max_size=None):
     """Получает самые недорогие объекты недвижимости по районам с фильтрацией по площади"""
     query = """
     WITH RankedProperties AS (
         SELECT 
-            *,
+            id, title, price, location, property_type, area, rooms, baths, geography,  -- Явно перечисляем нужные колонки
             ROW_NUMBER() OVER (PARTITION BY location ORDER BY price) as price_rank
         FROM properties
-        WHERE 1=1
+        WHERE 1=1 
     """
     
     params = []
+    if min_size is not None:
+        query += " AND area >= ?" # area здесь - это площадь из БД
+        params.append(min_size)
+    
     if max_size is not None:
-        query += " AND area <= ?"
+        query += " AND area <= ?" # area здесь - это площадь из БД
         params.append(max_size)
     
     query += f"""
     )
-    SELECT * FROM RankedProperties
+    SELECT id, title, price, location, property_type, area, rooms, baths, geography, price_rank FROM RankedProperties  -- Явно перечисляем нужные колонки
     WHERE price_rank <= ?
     ORDER BY location, price_rank
     """
@@ -126,38 +137,44 @@ def get_cheapest_properties_by_area(top_n=3, max_size=None):
     
     df = execute_query(query, params=tuple(params))
     
-    # Переименовываем колонки для совместимости
-    if df is not None:
+    if df is not None and not df.empty:
         if 'rooms' in df.columns:
             df['bedrooms'] = df['rooms']
         if 'baths' in df.columns:
             df['bathrooms'] = df['baths']
-        if 'location' in df.columns:
-            df['area'] = df['location']
+        
+        # 'area' в df - это числовая площадь из БД.
+        # 'location' в df - это текстовый район.
+        # Для карты нам нужен район для цветов и легенды, и площадь для информации.
+        # Не будем переименовывать 'area' (площадь).
+        # Для единообразия с тем, как карта ожидает район, будем использовать 'location' напрямую 
+        # или создадим 'district' если это предпочтительнее для остального кода.
+        # Пока оставим 'location' как есть, и 'area' как есть (числовая площадь).
+        # Карта должна будет использовать 'location' для группировки по цветам/легенде.
     
     return df
 
 def get_property(property_id):
     """Получает детальную информацию об объекте недвижимости по ID"""
-    query = "SELECT * FROM properties WHERE id = ?"
+    query = "SELECT id, title, price, location, property_type, area, rooms, baths, geography, property_url FROM properties WHERE id = ?"
     df = execute_query(query, params=(property_id,))
     
     if df is not None and not df.empty:
         property_dict = df.iloc[0].to_dict()
         
-        # Добавляем координаты, если есть geography
         if 'geography' in property_dict and property_dict['geography']:
             lat, lng = extract_coordinates(property_dict['geography'])
             property_dict['latitude'] = lat
             property_dict['longitude'] = lng
         
-        # Переименовываем поля для совместимости
         if 'rooms' in property_dict:
             property_dict['bedrooms'] = property_dict['rooms']
         if 'baths' in property_dict:
             property_dict['bathrooms'] = property_dict['baths']
-        if 'location' in property_dict:
-            property_dict['area'] = property_dict['location']
+        
+        # 'area' в property_dict - это числовая площадь из БД.
+        # 'location' в property_dict - это текстовый район.
+        # Не перезаписываем 'area'.
         
         return property_dict
     
@@ -211,26 +228,44 @@ def get_map_data(max_size=None):
                 df.at[idx, 'latitude'] = lat
                 df.at[idx, 'longitude'] = lng
         
+        # Добавляем стандартные имена колонок для совместимости
+        df['lat'] = df['latitude']
+        df['lon'] = df['longitude']
+        
         # Удаляем строки без координат
         df = df.dropna(subset=['latitude', 'longitude'])
+        
+        # Добавляем отладочную информацию
+        if not df.empty:
+            print(f"Пример данных после извлечения координат: {df.head(3)[['geography', 'latitude', 'longitude']].to_dict('records')}")
     
     return df
 
 def generate_area_colors(areas):
-    """Создает уникальные цвета для каждого района"""
-    unique_areas = list(set(areas))
+    """Создает цвета для каждого района из предопределенного списка Folium."""
+    folium_supported_colors = [
+        'red', 'blue', 'green', 'purple', 'orange', 'darkred', 'lightred', 'beige', 'darkblue', 'darkgreen',
+        'cadetblue', 'darkpurple', 'pink', 'lightblue', 'lightgreen', 'gray', 'black', 'lightgray'
+        # 'white' плохо видно на карте, поэтому исключен для маркеров
+    ]
+    unique_areas = sorted(list(set(areas))) # Сортируем для стабильного назначения цветов
     num_areas = len(unique_areas)
+    num_colors = len(folium_supported_colors)
     
-    # Генерируем равномерно распределенные цвета по HSV-кругу
     colors = {}
     for i, area in enumerate(unique_areas):
-        hue = i / num_areas
-        # Преобразуем HSV в RGB, затем в hex
-        r, g, b = colorsys.hsv_to_rgb(hue, 0.8, 0.9)
-        color = f'#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}'
-        colors[area] = color
+        # Циклически используем доступные цвета, если районов больше, чем цветов
+        colors[area] = folium_supported_colors[i % num_colors]
     
     return colors
+
+def get_folium_color(hex_color_or_name):
+    """Возвращает HEX-цвет или имя цвета для Folium Icon.
+       Теперь эта функция не нужна, так как generate_area_colors возвращает имена.
+       Оставляем на случай, если где-то еще используется, но лучше удалить.
+    """
+    # Просто возвращаем как есть, предполагая, что это уже имя цвета
+    return hex_color_or_name
 
 def main():
     st.title("Анализ недвижимости в Дубае")
@@ -299,306 +334,185 @@ def main():
     # Боковая панель с фильтрами
     st.sidebar.header("Параметры")
     
-    # Фильтр по площади объектов - меняем значение по умолчанию на 80 кв.м.
-    max_size = st.sidebar.slider("Максимальная площадь (кв.м.)", 40, 500, 80, 5)
+    # Изменяем слайдер для выбора диапазона площади
+    min_area_val, max_area_val = st.sidebar.slider(
+        "Площадь (кв.м.)", 
+        min_value=10,  # Минимально возможная площадь
+        max_value=400, # Максимально возможная площадь
+        value=(40, 150), # Значения по умолчанию (min, max)
+        step=5
+    )
+    top_n = st.sidebar.selectbox("Топ самых недорогих квартир по региону", [3, 5, 10, 15, 20], index=1) # Увеличил немного вариантов для top_n
     
-    # Выбор количества недорогих квартир для отображения
-    top_n = st.sidebar.selectbox("Топ самых недорогих квартир по региону", [3, 5, 10], index=0)
-    
-    # Главные вкладки
-    tab1, tab2, tab3, tab4 = st.tabs(["Карта", "Недорогие по районам", "Статистика", "Список объектов"])
-    
-    with tab1:
-        st.header("Карта объектов недвижимости")
-        st.caption(f"Объекты площадью до {max_size} кв.м.")
-        
-        # Получаем данные для карты
-        try:
-            map_data_df = get_map_data(max_size=max_size)
-            
-            # Выводим отладочную информацию
-            st.write(f"Загружено записей: {0 if map_data_df is None else len(map_data_df)}")
-            
-            if map_data_df is not None and not map_data_df.empty:
-                # Проверяем наличие координат
-                valid_coords = map_data_df[map_data_df['latitude'].notna() & map_data_df['longitude'].notna()]
-                st.write(f"Записей с координатами: {len(valid_coords)}")
-                
-                if len(valid_coords) > 0:
-                    # Генерируем цвета для районов
-                    area_colors = generate_area_colors(map_data_df['area'])
-                    
-                    try:
-                        # Создаем карту
-                        dubai_map = folium.Map(location=[25.2048, 55.2708], zoom_start=11)
-                        
-                        # Добавляем кластеризацию
-                        try:
-                            from folium.plugins import MarkerCluster
-                            marker_cluster = MarkerCluster().add_to(dubai_map)
-                        except Exception as cluster_error:
-                            st.error(f"Ошибка при создании кластеризации: {cluster_error}")
-                            # Если кластеризация не работает, добавляем маркеры напрямую на карту
-                            marker_cluster = dubai_map
-                        
-                        # Добавляем маркеры
-                        for _, row in valid_coords.iterrows():
-                            try:
-                                # Получаем цвет для района
-                                area = row.get('area', 'Неизвестно')
-                                color = area_colors.get(area, '#3186cc')  # Если район не найден, используем цвет по умолчанию
-                                
-                                # Создаем иконку с нужным цветом
-                                icon = folium.Icon(icon="home", prefix="fa", color=color.lstrip('#'))
-                                
-                                # Форматируем всплывающее окно
-                                popup_text = f"""
-                                <b>{row.get('title', 'Без названия')}</b><br>
-                                Цена: {row.get('price', 'Н/Д')} AED<br>
-                                Район: {area}<br>
-                                Тип: {row.get('property_type', 'Н/Д')}<br>
-                                Площадь: {row.get('size', 'Н/Д')} кв.м.<br>
-                                Спальни: {row.get('bedrooms', 'Н/Д')}<br>
-                                Ванные: {row.get('bathrooms', 'Н/Д')}<br>
-                                <a href="?property_id={row.get('id')}" target="_self">Подробнее</a>
-                                """
-                                
-                                folium.Marker(
-                                    location=[row['latitude'], row['longitude']],
-                                    popup=folium.Popup(popup_text, max_width=300),
-                                    tooltip=f"{row.get('title', 'Объект')} - {row.get('price', 'Н/Д')} AED",
-                                    icon=icon
-                                ).add_to(marker_cluster)
-                            except Exception as marker_error:
-                                st.error(f"Ошибка при добавлении маркера: {marker_error}")
-                        
-                        # Добавляем легенду для цветов районов
-                        legend_html = """
-                        <div style="position: fixed; 
-                                    bottom: 50px; left: 50px; width: 250px; height: auto;
-                                    border:2px solid grey; z-index:9999; font-size:12px;
-                                    background-color:white; padding: 10px;
-                                    overflow-y: auto; max-height: 300px;">
-                            <div style="font-weight: bold; margin-bottom: 5px;">Районы:</div>
-                        """
-                        
-                        # Добавляем цвета для каждого района
-                        for area, color in area_colors.items():
-                            legend_html += f"""
-                            <div style="display: flex; align-items: center; margin-bottom: 3px;">
-                                <div style="background-color: {color}; width: 15px; height: 15px; margin-right: 5px;"></div>
-                                <div>{area}</div>
-                            </div>
-                            """
-                        
-                        legend_html += "</div>"
-                        dubai_map.get_root().html.add_child(folium.Element(legend_html))
-                        
-                        # Отображаем карту
-                        try:
-                            folium_static(dubai_map, width=1200, height=600)
-                            st.info(f"Отображено {len(valid_coords)} объектов недвижимости. Точки раскрашены по районам.")
-                        except Exception as render_error:
-                            st.error(f"Ошибка при отображении карты: {render_error}")
-                    except Exception as map_error:
-                        st.error(f"Ошибка при создании карты: {map_error}")
-                else:
-                    st.warning("Не найдено объектов с координатами для отображения на карте")
-            else:
-                st.warning("Не удалось загрузить данные для карты")
-        except Exception as e:
-            st.error(f"Критическая ошибка при загрузке карты: {e}")
-    
-    with tab2:
-        st.header("Самые недорогие квартиры по районам")
-        st.caption(f"Топ-{top_n} недорогих квартир площадью до {max_size} кв.м. в каждом районе")
-        
-        # Получаем самые недорогие объекты по районам
-        cheapest_df = get_cheapest_properties_by_area(top_n=top_n, max_size=max_size)
-        
-        if cheapest_df is not None and not cheapest_df.empty:
-            # Сортируем по району и цене
-            cheapest_df = cheapest_df.sort_values(['area', 'price'])
-            
-            # Создаем график
-            fig = px.bar(
-                cheapest_df,
-                x='area',
-                y='price',
-                color='area',
-                hover_data=['title', 'size', 'bedrooms', 'bathrooms'],
-                labels={
-                    'area': 'Район',
-                    'price': 'Цена (AED)',
-                    'title': 'Название',
-                    'size': 'Площадь (кв.м.)',
-                    'bedrooms': 'Спальни',
-                    'bathrooms': 'Ванные'
-                },
-                title=f'Топ-{top_n} недорогих квартир в каждом районе'
-            )
-            
-            # Настраиваем макет
-            fig.update_layout(xaxis_tickangle=-45)
-            
-            # Отображаем график
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Отображаем таблицу с деталями
-            st.subheader("Детали недорогих квартир")
-            display_columns = ['title', 'area', 'price', 'size', 'bedrooms', 'bathrooms', 'property_type']
-            
-            # Проверяем наличие всех колонок
-            available_columns = [col for col in display_columns if col in cheapest_df.columns]
-            
-            st.dataframe(
-                cheapest_df[available_columns],
-                column_config={
-                    "title": "Название",
-                    "area": "Район",
-                    "price": st.column_config.NumberColumn("Цена (AED)", format="%.0f"),
-                    "size": st.column_config.NumberColumn("Площадь (кв.м.)", format="%.1f"),
-                    "bedrooms": "Спальни",
-                    "bathrooms": "Ванные",
-                    "property_type": "Тип недвижимости"
-                },
-                use_container_width=True
-            )
-        else:
-            st.warning("Не удалось загрузить данные о недорогих квартирах")
-    
-    with tab3:
-        st.header("Статистика по недвижимости")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Средняя цена по районам
-            avg_price_by_area_df = get_avg_price_by_area()
-            
-            if avg_price_by_area_df is not None and not avg_price_by_area_df.empty:
-                df_area = avg_price_by_area_df.sort_values(by='avg_price', ascending=False).head(10)
-                
-                fig = px.bar(
-                    df_area, 
-                    x='area', 
-                    y='avg_price',
-                    color='avg_price',
-                    labels={'area': 'Район', 'avg_price': 'Средняя цена (AED)'},
-                    title='Топ-10 районов по средней цене'
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.warning("Не удалось загрузить статистику по районам")
-        
-        with col2:
-            # Количество объектов по типу
-            count_by_type_df = get_count_by_property_type()
-            
-            if count_by_type_df is not None and not count_by_type_df.empty:
-                fig = px.pie(
-                    count_by_type_df, 
-                    values='count', 
-                    names='property_type', 
-                    title='Распределение по типам недвижимости'
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.warning("Не удалось загрузить статистику по типам недвижимости")
-    
-    with tab4:
-        st.header("Список объектов недвижимости")
-        st.caption(f"Объекты площадью до {max_size} кв.м.")
-        
-        # Параметры пагинации
-        page = st.sidebar.number_input("Страница", min_value=1, value=1)
-        limit = st.sidebar.selectbox("Объектов на странице", [10, 25, 50, 100], index=1)
-        offset = (page - 1) * limit
-        
-        # Получаем список объектов с учетом фильтра по площади
-        properties_result = get_properties(limit=limit, offset=offset, max_size=max_size)
-        
-        if properties_result and 'data' in properties_result and properties_result['data'] is not None:
-            # Отображаем таблицу
-            df_properties = properties_result['data']
-            
-            if not df_properties.empty:
-                # Преобразуем названия колонок для отображения
-                if 'rooms' in df_properties.columns:
-                    df_properties['bedrooms'] = df_properties['rooms']
-                if 'baths' in df_properties.columns:
-                    df_properties['bathrooms'] = df_properties['baths']
-                if 'location' in df_properties.columns:
-                    df_properties['area'] = df_properties['location']
-                
-                # Выбираем только нужные колонки для отображения
-                display_columns = ['id', 'title', 'price', 'area', 'area', 'property_type', 'bedrooms', 'bathrooms']
-                
-                # Проверяем наличие всех колонок
-                available_columns = [col for col in display_columns if col in df_properties.columns]
-                
-                df_display = df_properties[available_columns]
-                
-                st.dataframe(
-                    df_display,
-                    column_config={
-                        "title": "Название",
-                        "price": st.column_config.NumberColumn("Цена (AED)", format="%.0f"),
-                        "area": "Район",
-                        "area": st.column_config.NumberColumn("Площадь (кв.м.)", format="%.1f"),
-                        "property_type": "Тип недвижимости",
-                        "bedrooms": "Спальни",
-                        "bathrooms": "Ванные"
-                    },
-                    use_container_width=True
-                )
-                
-                # Информация о пагинации
-                total_pages = (properties_result['total'] // limit) + (1 if properties_result['total'] % limit > 0 else 0)
-                st.info(f"Показано {len(df_properties)} из {properties_result['total']} объектов. Страница {page} из {total_pages}")
-            else:
-                st.warning("Нет данных для отображения")
-        else:
-            st.warning("Не удалось загрузить список объектов")
+    # Обновляем заголовок для отображения диапазона площади
+    st.header(f"Топ-{top_n} недорогих объектов по районам (площадь от {min_area_val} до {max_area_val} кв.м.)")
 
-    # Проверяем, есть ли запрос на просмотр детальной информации
+    # Получаем данные "топ N по районам с фильтром площади"
+    # Передаем min_area_val и max_area_val в функцию
+    map_data_df = get_cheapest_properties_by_area(top_n=top_n, min_size=min_area_val, max_size=max_area_val)
+
+    if map_data_df is not None and not map_data_df.empty:
+        # Преобразуем координаты, если они еще не в нужном формате
+        # (get_cheapest_properties_by_area может не содержать lat/lon напрямую, а только geography)
+        if 'latitude' not in map_data_df.columns or 'longitude' not in map_data_df.columns:
+            # Предполагаем, что есть столбец 'geography'
+            coords = map_data_df['geography'].apply(lambda x: pd.Series(extract_coordinates(x), index=['latitude', 'longitude']))
+            map_data_df = pd.concat([map_data_df, coords], axis=1)
+
+        # Используем .copy() чтобы избежать SettingWithCopyWarning при добавлении колонок lat/lon
+        valid_coords_df = map_data_df[map_data_df['latitude'].notna() & map_data_df['longitude'].notna()].copy()
+        
+        st.write(f"Найдено объектов для отображения на карте (исходно с lat/lon): {len(valid_coords_df)}")
+        
+        if not valid_coords_df.empty:
+            # Отладочный вывод исходных данных, если нужно будет раскомментировать
+            # st.write("Пример исходных lat/lon (первые 5):")
+            # st.dataframe(valid_coords_df[['latitude', 'longitude', 'location']].head())
+
+            original_lat_lon_for_debug = valid_coords_df[['latitude', 'longitude']].copy()
+
+            valid_coords_df['lat'] = pd.to_numeric(valid_coords_df['latitude'], errors='coerce')
+            valid_coords_df['lon'] = pd.to_numeric(valid_coords_df['longitude'], errors='coerce')
+            
+            nan_in_lat = valid_coords_df['lat'].isna().sum()
+            nan_in_lon = valid_coords_df['lon'].isna().sum()
+            if nan_in_lat > 0 or nan_in_lon > 0:
+                 st.warning(f"После pd.to_numeric появилось {nan_in_lat} NaN в 'lat' и {nan_in_lon} NaN в 'lon'.")
+                 # Можно добавить вывод проблемных строк, если потребуется:
+                 # st.write("Строки, где latitude/longitude не смогли преобразоваться в числа:")
+                 # st.dataframe(original_lat_lon_for_debug[valid_coords_df['lat'].isna() | valid_coords_df['lon'].isna()])
+
+            count_before_dropna = len(valid_coords_df)
+            valid_coords_df.dropna(subset=['lat', 'lon'], inplace=True)
+            st.write(f"Объектов после dropna(lat,lon): {len(valid_coords_df)} (было {count_before_dropna})")
+            
+            if not valid_coords_df.empty:
+                st.write(f"Диапазоны координат перед гео-фильтром для {len(valid_coords_df)} объектов: "
+                         f"Lat: ({valid_coords_df['lat'].min():.4f}, {valid_coords_df['lat'].max():.4f}), "
+                         f"Lon: ({valid_coords_df['lon'].min():.4f}, {valid_coords_df['lon'].max():.4f})")
+            
+            df_before_geofilter = valid_coords_df.copy() # Копируем перед гео-фильтрацией для отладки
+            # Фильтрация по координатам Дубая
+            valid_coords_df = valid_coords_df[
+                (valid_coords_df['lat'] > 24) & (valid_coords_df['lat'] < 26) &
+                (valid_coords_df['lon'] > 54) & (valid_coords_df['lon'] < 56)
+            ]
+            st.write(f"Объектов после гео-фильтра (24-26, 54-56): {len(valid_coords_df)} (было {len(df_before_geofilter)})")
+
+            if len(df_before_geofilter) > 0 and len(valid_coords_df) == 0:
+                st.error("Все объекты были отфильтрованы гео-фильтром! Проверьте диапазоны координат выше.")
+                st.write("Первые 10 объектов до гео-фильтра:")
+                st.dataframe(df_before_geofilter[['lat', 'lon', 'location', 'price']].head(10))
+
+            if not valid_coords_df.empty:
+                map_center_lat = valid_coords_df['lat'].mean()
+                map_center_lon = valid_coords_df['lon'].mean()
+
+                st.write(f"Центр карты: [{map_center_lat}, {map_center_lon}], количество объектов: {len(valid_coords_df)}")
+
+                # --- Убираем УПРОЩЕННУЮ тестовую карту ---
+                # dubai_map_simple_test = folium.Map(location=[25.2048, 55.2708], zoom_start=10)
+                # folium.Marker(
+                #     [25.2048, 55.2708],
+                #     popup="Тестовый маркер",
+                #     tooltip="Тест"
+                # ).add_to(dubai_map_simple_test)
+                # st.write("Попытка отобразить УПРОЩЕННУЮ тестовую карту с одним маркером...")
+                # folium_static(dubai_map_simple_test, width=None, height=500)
+                # st.write("--- УПРОЩЕННАЯ тестовая карта должна была отобразиться выше ---")
+                
+                # --- ШАГ 1: Возвращаем MarkerCluster на пустую карту --- 
+                st.write("ШАГ 1: Попытка отобразить карту с MarkerCluster (пока без маркеров объектов и легенды)...")
+                dubai_map = folium.Map(location=[map_center_lat, map_center_lon], zoom_start=10)
+                marker_cluster = folium.plugins.MarkerCluster().add_to(dubai_map) 
+                
+                st.write("ШАГ 2: Добавляем маркеры объектов в MarkerCluster...")
+                # Возвращаем генерацию цветов и цикл добавления маркеров
+                if 'location' in valid_coords_df.columns:
+                    area_colors = generate_area_colors(valid_coords_df['location'])
+                else:
+                    st.warning("Колонка 'location' (район) не найдена для генерации цветов карты.")
+                    area_colors = {}
+
+                markers_added_count = 0
+                for _, row in valid_coords_df.iterrows(): 
+                    try:
+                        # Возвращаем информативные попапы, тултипы и цвета
+                        price_str = f"{row.get('price', 'Н/Д'):,} AED" if pd.notna(row.get('price')) else "Цена Н/Д"
+                        size_val = row.get('area') 
+                        size_str = f"{size_val} кв.м." if pd.notna(size_val) else "Площадь Н/Д"
+                        tooltip_text = f"{price_str} - {size_str}"
+                        area_name = row.get('location', 'Неизвестно') 
+                        marker_color_name = area_colors.get(area_name, 'blue') # Используем цвет или синий по умолчанию
+                        
+                        popup_html = (
+                            f"<b>{row.get('title', 'Без названия')}</b><br>"
+                            f"Цена: {price_str}<br>"
+                            f"Район: {area_name}<br>"
+                            f"Площадь: {size_str}<br>"
+                            f"Тип: {row.get('property_type', 'Н/Д')}<br>"
+                            f"Спальни: {row.get('bedrooms', 'Н/Д')}<br>"
+                            f"Ванные: {row.get('bathrooms', 'Н/Д')}<br>"
+                            f"<a href='?property_id={row.get("id")}' target='_self'>Подробнее</a>"
+                        )
+
+                        folium.Marker(
+                            location=[row['lat'], row['lon']],
+                            popup=folium.Popup(popup_html, max_width=300),
+                            tooltip=tooltip_text,
+                            icon=folium.Icon(color=marker_color_name, icon='home', prefix='fa') # Вернули fa-home и кастомный цвет
+                        ).add_to(marker_cluster)
+                        markers_added_count += 1
+                    except Exception as e:
+                        st.error(f"Ошибка при добавлении маркера для объекта ID {row.get('id', 'N/A')}: {e}")
+                        st.dataframe(row.to_frame().T)
+                
+                st.write(f"Добавлено маркеров в кластер: {markers_added_count} из {len(valid_coords_df)} объектов.")
+
+                # Возвращаем folium_static
+                folium_static(dubai_map, width=None, height=600)
+                st.write("--- Карта с маркерами объектов (без легенды) должна была отобразиться выше ---")
+                st.info(f"Отображено объектов на карте (с маркерами): {markers_added_count}")
+
+            else:
+                st.warning("Не найдено объектов с извлеченными координатами (дополнительная обработка не проводилась).")
+        else:
+            st.warning("Не удалось загрузить данные о недорогих квартирах.")
+
+    # Проверяем, есть ли запрос на просмотр детальной информации (оставляем, если полезно)
     query_params = st.query_params
-    property_id = query_params.get("property_id", None)
+    property_id_query = query_params.get("property_id", None) # Изменил имя переменной во избежание конфликта
     
-    if property_id:
-        property_details = get_property(property_id)
+    if property_id_query:
+        property_details = get_property(property_id_query) 
         if property_details:
             st.subheader(f"Детали объекта: {property_details.get('title', 'Без названия')}")
-            
+            formatted_data = {
+                "ID Объекта": property_details.get('id', 'Н/Д'), # Добавляем ID
+                "Название": property_details.get('title', 'Без названия'),
+                "Цена": f"{property_details.get('price', 'Н/Д')} AED",
+                "Район": property_details.get('location', 'Н/Д'), 
+                "Тип": property_details.get('property_type', 'Н/Д'),
+                "Площадь": f"{property_details.get('area')} кв.м." if pd.notna(property_details.get('area')) else "Площадь Н/Д", 
+                "Спальни": property_details.get('bedrooms', 'Н/Д'),
+                "Ванные": property_details.get('bathrooms', 'Н/Д'),
+                "Ссылка на источник": property_details.get('property_url', 'Н/Д') # Добавляем ссылку
+                # Поля "Дата обновления" нужно будет добавить сюда,
+                # если они есть в property_details (т.е. в get_property и в БД)
+            }
             col1, col2 = st.columns(2)
-            
             with col1:
-                st.write(f"**Цена:** {property_details.get('price', 'Н/Д')} AED")
-                st.write(f"**Район:** {property_details.get('area', 'Н/Д')}")
-                st.write(f"**Тип недвижимости:** {property_details.get('property_type', 'Н/Д')}")
-                st.write(f"**Спальни:** {property_details.get('bedrooms', 'Н/Д')}")
-                st.write(f"**Ванные:** {property_details.get('bathrooms', 'Н/Д')}")
-            
+                for key, value in formatted_data.items():
+                    # Для id и ссылки можно сделать специальное отображение, если нужно
+                    if key == "Ссылка на источник" and value and value != 'Н/Д':
+                        st.markdown(f"**{key}:** <a href='{value}' target='_blank'>{value}</a>", unsafe_allow_html=True)
+                    elif key == "ID Объекта":
+                        st.write(f"**{key}:** {value}") # Просто выводим ID
+                    elif key != 'id': # Старое условие, которое теперь не совсем актуально, но не мешает
+                        st.write(f"**{key}:** {value}")
             with col2:
-                st.write(f"**Площадь:** {property_details.get('area', 'Н/Д')} кв.м.")
-                st.write(f"**Статус:** {property_details.get('status', 'Н/Д')}")
-                
-                # Если есть координаты, показываем маленькую карту
-                if 'latitude' in property_details and pd.notna(property_details.get('latitude')) and pd.notna(property_details.get('longitude')):
-                    property_map = folium.Map(
-                        location=[property_details['latitude'], property_details['longitude']], 
-                        zoom_start=15
-                    )
-                    
-                    folium.Marker(
-                        location=[property_details['latitude'], property_details['longitude']],
-                        popup=property_details.get('title', 'Объект'),
-                        icon=folium.Icon(icon="home", prefix="fa")
-                    ).add_to(property_map)
-                    
-                    folium_static(property_map, width=400, height=300)
+                 # ... (можно добавить карту для одного объекта или график сравнения цены)
+                 pass # пока пусто
 
 if __name__ == "__main__":
     main() 
