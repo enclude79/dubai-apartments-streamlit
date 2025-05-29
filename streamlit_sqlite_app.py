@@ -269,215 +269,90 @@ def get_folium_color(hex_color_or_name):
 
 def main():
     st.title("Анализ недвижимости в Дубае")
-    
+
     # Проверка наличия и доступности базы данных
     if not os.path.isfile(SQLITE_DB_PATH):
         st.error(f"Файл базы данных не найден: {SQLITE_DB_PATH}")
         st.info("Проверьте, что файл базы данных загружен в репозиторий и находится в корневой директории проекта.")
         return
-    
-    try:
-        db_size = os.path.getsize(SQLITE_DB_PATH) / (1024 * 1024)  # Размер в МБ
-        db_modified = datetime.fromtimestamp(os.path.getmtime(SQLITE_DB_PATH))
-        st.sidebar.info(f"База данных: {os.path.basename(SQLITE_DB_PATH)}\nРазмер: {db_size:.2f} МБ\nПоследнее обновление: {db_modified.strftime('%d.%m.%Y %H:%M')}")
-        
-        # Проверяем доступность базы данных
-        conn = get_db_connection()
-        if conn is None:
-            st.error("Не удалось подключиться к базе данных.")
-            return
-            
-        # Проверяем структуру базы данных
-        try:
-            tables_df = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table';", conn)
-            if 'properties' not in tables_df['name'].values:
-                st.error("В базе данных отсутствует таблица 'properties'.")
-                st.write("Найденные таблицы:", tables_df)
-                conn.close()
-                return
-                
-            # Проверяем наличие записей
-            count_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties;", conn)
-            record_count = count_df.iloc[0]['count']
-            
-            # Проверяем наличие координат - изменяем запрос, убираем json_extract
-            coords_df = pd.read_sql_query("SELECT COUNT(*) as count FROM properties WHERE geography IS NOT NULL;", conn)
-            coords_count = coords_df.iloc[0]['count']
-            
-            st.sidebar.info(f"Всего записей: {record_count}\nЗаписей с координатами: {coords_count}")
-            
-            if coords_count == 0 and record_count > 0:
-                st.sidebar.warning("В базе данных нет записей с координатами (поле 'geography'). Карта не может быть отображена.")
-        except Exception as db_error:
-            st.error(f"Ошибка при проверке структуры базы данных: {db_error}")
-        finally:
-            conn.close()
-    except Exception as e:
-        st.error(f"Ошибка при проверке базы данных: {e}")
-        return
-    
-    # Отображаем информацию о базе данных
-    db_exists = os.path.isfile(SQLITE_DB_PATH)
-    if db_exists:
-        db_size = os.path.getsize(SQLITE_DB_PATH) / (1024 * 1024)  # Размер в МБ
-        db_modified = datetime.fromtimestamp(os.path.getmtime(SQLITE_DB_PATH))
-        st.sidebar.info(
-            f"База данных: {SQLITE_DB_PATH}\n"
-            f"Размер: {db_size:.2f} МБ\n"
-            f"Последнее обновление: {db_modified.strftime('%d.%m.%Y %H:%M')}"
-        )
-    else:
-        st.sidebar.error(f"База данных {SQLITE_DB_PATH} не найдена!")
-        st.error(f"База данных {SQLITE_DB_PATH} не найдена! Убедитесь, что файл базы данных находится в той же директории, что и приложение.")
-        return
-    
-    # Боковая панель с фильтрами
-    st.sidebar.header("Параметры")
-    
-    # Изменяем слайдер для выбора диапазона площади
-    min_area_val, max_area_val = st.sidebar.slider(
-        "Площадь (кв.м.)", 
-        min_value=10,  # Минимально возможная площадь
-        max_value=400, # Максимально возможная площадь
-        value=(40, 150), # Значения по умолчанию (min, max)
-        step=5
-    )
-    top_n = st.sidebar.selectbox("Топ самых недорогих квартир по региону", [3, 5, 10, 15, 20], index=1) # Увеличил немного вариантов для top_n
-    
-    # Обновляем заголовок для отображения диапазона площади
+
+    # --- Компактные фильтры сверху ---
+    with st.container():
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            min_area_val, max_area_val = st.slider(
+                "Площадь (кв.м.)",
+                min_value=10,
+                max_value=400,
+                value=(40, 150),
+                step=5,
+                key="area_slider"
+            )
+        with col2:
+            top_n = st.selectbox(
+                "Топ самых недорогих квартир по региону",
+                [3, 5, 10, 15, 20],
+                index=1,
+                key="top_n_select"
+            )
+
     st.header(f"Топ-{top_n} недорогих объектов по районам (площадь от {min_area_val} до {max_area_val} кв.м.)")
 
     # Получаем данные "топ N по районам с фильтром площади"
-    # Передаем min_area_val и max_area_val в функцию
     map_data_df = get_cheapest_properties_by_area(top_n=top_n, min_size=min_area_val, max_size=max_area_val)
 
     if map_data_df is not None and not map_data_df.empty:
-        # Преобразуем координаты, если они еще не в нужном формате
-        # (get_cheapest_properties_by_area может не содержать lat/lon напрямую, а только geography)
         if 'latitude' not in map_data_df.columns or 'longitude' not in map_data_df.columns:
-            # Предполагаем, что есть столбец 'geography'
             coords = map_data_df['geography'].apply(lambda x: pd.Series(extract_coordinates(x), index=['latitude', 'longitude']))
             map_data_df = pd.concat([map_data_df, coords], axis=1)
 
-        # Используем .copy() чтобы избежать SettingWithCopyWarning при добавлении колонок lat/lon
         valid_coords_df = map_data_df[map_data_df['latitude'].notna() & map_data_df['longitude'].notna()].copy()
-        
-        st.write(f"Найдено объектов для отображения на карте (исходно с lat/lon): {len(valid_coords_df)}")
-        
+        valid_coords_df['lat'] = pd.to_numeric(valid_coords_df['latitude'], errors='coerce')
+        valid_coords_df['lon'] = pd.to_numeric(valid_coords_df['longitude'], errors='coerce')
+        valid_coords_df.dropna(subset=['lat', 'lon'], inplace=True)
+
         if not valid_coords_df.empty:
-            # Отладочный вывод исходных данных, если нужно будет раскомментировать
-            # st.write("Пример исходных lat/lon (первые 5):")
-            # st.dataframe(valid_coords_df[['latitude', 'longitude', 'location']].head())
+            map_center_lat = valid_coords_df['lat'].mean()
+            map_center_lon = valid_coords_df['lon'].mean()
+            dubai_map = folium.Map(location=[map_center_lat, map_center_lon], zoom_start=10)
+            marker_cluster = folium.plugins.MarkerCluster().add_to(dubai_map)
 
-            original_lat_lon_for_debug = valid_coords_df[['latitude', 'longitude']].copy()
-
-            valid_coords_df['lat'] = pd.to_numeric(valid_coords_df['latitude'], errors='coerce')
-            valid_coords_df['lon'] = pd.to_numeric(valid_coords_df['longitude'], errors='coerce')
-            
-            nan_in_lat = valid_coords_df['lat'].isna().sum()
-            nan_in_lon = valid_coords_df['lon'].isna().sum()
-            if nan_in_lat > 0 or nan_in_lon > 0:
-                 st.warning(f"После pd.to_numeric появилось {nan_in_lat} NaN в 'lat' и {nan_in_lon} NaN в 'lon'.")
-                 # Можно добавить вывод проблемных строк, если потребуется:
-                 # st.write("Строки, где latitude/longitude не смогли преобразоваться в числа:")
-                 # st.dataframe(original_lat_lon_for_debug[valid_coords_df['lat'].isna() | valid_coords_df['lon'].isna()])
-
-            count_before_dropna = len(valid_coords_df)
-            valid_coords_df.dropna(subset=['lat', 'lon'], inplace=True)
-            st.write(f"Объектов после dropna(lat,lon): {len(valid_coords_df)} (было {count_before_dropna})")
-            
-            if not valid_coords_df.empty:
-                st.write(f"Диапазоны координат перед гео-фильтром для {len(valid_coords_df)} объектов: "
-                         f"Lat: ({valid_coords_df['lat'].min():.4f}, {valid_coords_df['lat'].max():.4f}), "
-                         f"Lon: ({valid_coords_df['lon'].min():.4f}, {valid_coords_df['lon'].max():.4f})")
-            
-            df_before_geofilter = valid_coords_df.copy() # Копируем перед гео-фильтрацией для отладки
-            # Фильтрация по координатам Дубая
-            valid_coords_df = valid_coords_df[
-                (valid_coords_df['lat'] > 24) & (valid_coords_df['lat'] < 26) &
-                (valid_coords_df['lon'] > 54) & (valid_coords_df['lon'] < 56)
-            ]
-            st.write(f"Объектов после гео-фильтра (24-26, 54-56): {len(valid_coords_df)} (было {len(df_before_geofilter)})")
-
-            if len(df_before_geofilter) > 0 and len(valid_coords_df) == 0:
-                st.error("Все объекты были отфильтрованы гео-фильтром! Проверьте диапазоны координат выше.")
-                st.write("Первые 10 объектов до гео-фильтра:")
-                st.dataframe(df_before_geofilter[['lat', 'lon', 'location', 'price']].head(10))
-
-            if not valid_coords_df.empty:
-                map_center_lat = valid_coords_df['lat'].mean()
-                map_center_lon = valid_coords_df['lon'].mean()
-
-                st.write(f"Центр карты: [{map_center_lat}, {map_center_lon}], количество объектов: {len(valid_coords_df)}")
-
-                # --- Убираем УПРОЩЕННУЮ тестовую карту ---
-                # dubai_map_simple_test = folium.Map(location=[25.2048, 55.2708], zoom_start=10)
-                # folium.Marker(
-                #     [25.2048, 55.2708],
-                #     popup="Тестовый маркер",
-                #     tooltip="Тест"
-                # ).add_to(dubai_map_simple_test)
-                # st.write("Попытка отобразить УПРОЩЕННУЮ тестовую карту с одним маркером...")
-                # folium_static(dubai_map_simple_test, width=None, height=500)
-                # st.write("--- УПРОЩЕННАЯ тестовая карта должна была отобразиться выше ---")
-                
-                # --- ШАГ 1: Возвращаем MarkerCluster на пустую карту --- 
-                st.write("ШАГ 1: Попытка отобразить карту с MarkerCluster (пока без маркеров объектов и легенды)...")
-                dubai_map = folium.Map(location=[map_center_lat, map_center_lon], zoom_start=10)
-                marker_cluster = folium.plugins.MarkerCluster().add_to(dubai_map) 
-                
-                st.write("ШАГ 2: Добавляем маркеры объектов в MarkerCluster...")
-                # Возвращаем генерацию цветов и цикл добавления маркеров
-                if 'location' in valid_coords_df.columns:
-                    area_colors = generate_area_colors(valid_coords_df['location'])
-                else:
-                    st.warning("Колонка 'location' (район) не найдена для генерации цветов карты.")
-                    area_colors = {}
-
-                markers_added_count = 0
-                for _, row in valid_coords_df.iterrows(): 
-                    try:
-                        # Возвращаем информативные попапы, тултипы и цвета
-                        price_str = f"{row.get('price', 'Н/Д'):,} AED" if pd.notna(row.get('price')) else "Цена Н/Д"
-                        size_val = row.get('area') 
-                        size_str = f"{size_val} кв.м." if pd.notna(size_val) else "Площадь Н/Д"
-                        tooltip_text = f"{price_str} - {size_str}"
-                        area_name = row.get('location', 'Неизвестно') 
-                        marker_color_name = area_colors.get(area_name, 'blue') # Используем цвет или синий по умолчанию
-                        
-                        popup_html = (
-                            f"<b>{row.get('title', 'Без названия')}</b><br>"
-                            f"Цена: {price_str}<br>"
-                            f"Район: {area_name}<br>"
-                            f"Площадь: {size_str}<br>"
-                            f"Тип: {row.get('property_type', 'Н/Д')}<br>"
-                            f"Спальни: {row.get('bedrooms', 'Н/Д')}<br>"
-                            f"Ванные: {row.get('bathrooms', 'Н/Д')}<br>"
-                            f"<a href='?property_id={row.get("id")}' target='_self'>Подробнее</a>"
-                        )
-
-                        folium.Marker(
-                            location=[row['lat'], row['lon']],
-                            popup=folium.Popup(popup_html, max_width=300),
-                            tooltip=tooltip_text,
-                            icon=folium.Icon(color=marker_color_name, icon='home', prefix='fa') # Вернули fa-home и кастомный цвет
-                        ).add_to(marker_cluster)
-                        markers_added_count += 1
-                    except Exception as e:
-                        st.error(f"Ошибка при добавлении маркера для объекта ID {row.get('id', 'N/A')}: {e}")
-                        st.dataframe(row.to_frame().T)
-                
-                st.write(f"Добавлено маркеров в кластер: {markers_added_count} из {len(valid_coords_df)} объектов.")
-
-                # Возвращаем folium_static
-                folium_static(dubai_map, width=None, height=600)
-                st.write("--- Карта с маркерами объектов (без легенды) должна была отобразиться выше ---")
-                st.info(f"Отображено объектов на карте (с маркерами): {markers_added_count}")
-
+            if 'location' in valid_coords_df.columns:
+                area_colors = generate_area_colors(valid_coords_df['location'])
             else:
-                st.warning("Не найдено объектов с извлеченными координатами (дополнительная обработка не проводилась).")
+                area_colors = {}
+
+            for _, row in valid_coords_df.iterrows():
+                try:
+                    price_str = f"{row.get('price', 'Н/Д'):,} AED" if pd.notna(row.get('price')) else "Цена Н/Д"
+                    size_val = row.get('area')
+                    size_str = f"{size_val} кв.м." if pd.notna(size_val) else "Площадь Н/Д"
+                    tooltip_text = f"{price_str} - {size_str}"
+                    area_name = row.get('location', 'Неизвестно')
+                    marker_color_name = area_colors.get(area_name, 'blue')
+                    popup_html = (
+                        f"<b>{row.get('title', 'Без названия')}</b><br>"
+                        f"Цена: {price_str}<br>"
+                        f"Район: {area_name}<br>"
+                        f"Площадь: {size_str}<br>"
+                        f"Тип: {row.get('property_type', 'Н/Д')}<br>"
+                        f"Спальни: {row.get('bedrooms', 'Н/Д')}<br>"
+                        f"Ванные: {row.get('bathrooms', 'Н/Д')}<br>"
+                        f"<a href='?property_id={row.get('id')}' target='_self'>Подробнее</a>"
+                    )
+                    folium.Marker(
+                        location=[row['lat'], row['lon']],
+                        popup=folium.Popup(popup_html, max_width=300),
+                        tooltip=tooltip_text,
+                        icon=folium.Icon(color=marker_color_name, icon='home', prefix='fa')
+                    ).add_to(marker_cluster)
+                except Exception:
+                    pass
+            folium_static(dubai_map, width=None, height=600)
         else:
-            st.warning("Не удалось загрузить данные о недорогих квартирах.")
+            st.warning("Нет объектов с координатами для отображения на карте.")
+    else:
+        st.warning("Нет данных для отображения.")
 
     # Проверяем, есть ли запрос на просмотр детальной информации (оставляем, если полезно)
     query_params = st.query_params

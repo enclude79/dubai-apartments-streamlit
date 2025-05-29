@@ -4,54 +4,32 @@
 # Path to Git executable
 $gitPath = "C:\Program Files\Git\cmd\git.exe"
 
-# Prompt user for commit message
-$commitMessage = Read-Host -Prompt "Enter commit message (e.g., 'Update data')"
-
-if (-not $commitMessage) {
-    $commitMessage = "Automatic commit: Update files"
-    Write-Host "Using default commit message: $commitMessage"
-}
-
-# 0. Pull latest changes first
-Write-Host "Pulling latest changes from GitHub..."
-& $gitPath pull --no-edit
-if ($LASTEXITCODE -ne 0) {
-    Write-Warning "There might be conflicts that need to be resolved manually."
-    # Continue anyway, as we'll add our changes on top
-}
-else {
-    Write-Host "Latest changes pulled successfully."
-}
-
-# 1. Add all files
-Write-Host "Adding all files to Git index..."
+# Add all changes
+Write-Host "Adding changes to Git..."
 & $gitPath add .
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "Error during 'git add .'"
+    Write-Error "Error during 'git add'"
     exit 1
 }
-Write-Host "Files added successfully."
 
-# 2. Commit
-Write-Host "Creating commit with message: '$commitMessage'..."
-& $gitPath commit -m "$commitMessage"
+# Commit changes
+$commitMessage = "Update: Изменения в приложении Streamlit"
+Write-Host "Committing changes..."
+& $gitPath commit -m $commitMessage
 if ($LASTEXITCODE -ne 0) {
-    Write-Warning "Error during 'git commit'. Maybe no changes to commit."
-    # Do not exit, as it might be normal if there are no changes
-}
-else {
-    Write-Host "Commit created successfully."
+    Write-Error "Error during 'git commit'"
+    exit 1
 }
 
-# 3. Push changes to remote repository
-Write-Host "Pushing changes to GitHub remote repository..."
+# Push changes
+Write-Host "Pushing changes to GitHub..."
 & $gitPath push
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "Error during 'git push'. Ensure your repository is configured correctly and you have access."
+    Write-Error "Error during 'git push'"
     exit 1
 }
-Write-Host "Changes pushed to GitHub successfully!"
 
+Write-Host "Changes pushed to GitHub successfully!"
 Write-Host "Process completed."
 # Keep window open to view results
 # Read-Host -Prompt "Press Enter to exit" 
