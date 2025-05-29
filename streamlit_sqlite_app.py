@@ -330,6 +330,12 @@ def main():
                     tooltip_text = f"{price_str} - {size_str}"
                     area_name = row.get('location', 'Неизвестно')
                     marker_color_name = area_colors.get(area_name, 'blue')
+                    property_url = row.get('property_url') if 'property_url' in row else None
+                    # Формируем ссылку только если она есть
+                    if property_url and isinstance(property_url, str) and property_url.strip():
+                        more_link = f'<a href="{property_url}" target="_blank" rel="noopener noreferrer">Подробнее</a>'
+                    else:
+                        more_link = ''
                     popup_html = (
                         f"<b>{row.get('title', 'Без названия')}</b><br>"
                         f"Цена: {price_str}<br>"
@@ -338,7 +344,7 @@ def main():
                         f"Тип: {row.get('property_type', 'Н/Д')}<br>"
                         f"Спальни: {row.get('bedrooms', 'Н/Д')}<br>"
                         f"Ванные: {row.get('bathrooms', 'Н/Д')}<br>"
-                        f"<a href='?property_id={row.get('id')}' target='_self'>Подробнее</a>"
+                        f"{more_link}"
                     )
                     folium.Marker(
                         location=[row['lat'], row['lon']],
