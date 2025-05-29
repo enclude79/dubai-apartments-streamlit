@@ -112,7 +112,7 @@ def get_cheapest_properties_by_area(top_n=3, min_size=None, max_size=None):
     query = """
     WITH RankedProperties AS (
         SELECT 
-            id, title, price, location, property_type, area, rooms, baths, geography,  -- Явно перечисляем нужные колонки
+            id, title, price, location, property_type, area, rooms, baths, geography, property_url,  -- Добавил property_url
             ROW_NUMBER() OVER (PARTITION BY location ORDER BY price) as price_rank
         FROM properties
         WHERE 1=1 
@@ -129,7 +129,7 @@ def get_cheapest_properties_by_area(top_n=3, min_size=None, max_size=None):
     
     query += f"""
     )
-    SELECT id, title, price, location, property_type, area, rooms, baths, geography, price_rank FROM RankedProperties  -- Явно перечисляем нужные колонки
+    SELECT id, title, price, location, property_type, area, rooms, baths, geography, property_url, price_rank FROM RankedProperties  -- Добавил property_url
     WHERE price_rank <= ?
     ORDER BY location, price_rank
     """
