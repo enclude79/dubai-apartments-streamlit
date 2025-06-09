@@ -1,1 +1,0 @@
-Произошла ошибка при анализе данных: Object of type Decimal is not JSON serializable
